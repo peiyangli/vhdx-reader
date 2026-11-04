@@ -1,0 +1,13 @@
+// macOS application identity. Only the host CPU architecture is packaged initially.
+PRODUCT_NAME = VHDX Reader
+PRODUCT_BUNDLE_IDENTIFIER = org.vhdxreader.reader
+PRODUCT_COPYRIGHT = Copyright © 2026 VHDX Reader contributors. MIT License.
+MACOSX_DEPLOYMENT_TARGET = 12.0
+ARCHS = arm64
+VHDX_NATIVE_ARCH = arm64
+ONLY_ACTIVE_ARCH = YES
+CODE_SIGN_IDENTITY = -
+CODE_SIGN_STYLE = Manual
+DEVELOPMENT_TEAM =
+
+#include? "NativeBuild.xcconfig"

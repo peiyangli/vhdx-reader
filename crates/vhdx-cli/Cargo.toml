@@ -1,0 +1,17 @@
+[package]
+name = "vhdx-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vhdx"
+path = "src/main.rs"
+
+[dependencies]
+vhdx-core = { path = "../vhdx-core" }
+clap.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zeroize.workspace = true

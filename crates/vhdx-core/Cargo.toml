@@ -1,0 +1,16 @@
+[package]
+name = "vhdx-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+zeroize.workspace = true
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.190"

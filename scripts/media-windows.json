@@ -1,0 +1,21 @@
+{
+  "archives": [
+    {
+      "name": "libmpv",
+      "archive": "mpv-dev-x86_64-20230924-git-652a1dd.7z",
+      "url": "https://github.com/media-kit/libmpv-win32-video-build/releases/download/2023-09-24/mpv-dev-x86_64-20230924-git-652a1dd.7z",
+      "sha256": "dce982222d7a23e4a1c6f0fb6cc39f6e899a6714624b95ea49cff6558ee97572"
+    },
+    {
+      "name": "ANGLE",
+      "archive": "ANGLE.7z",
+      "url": "https://github.com/alexmercerind/flutter-windows-ANGLE-OpenGL-ES/releases/download/v1.0.1/ANGLE.7z",
+      "sha256": "cc5911bb15d596fd5a2b362613ad35b7093b427117269a7359054a65746a5f9a"
+    }
+  ],
+  "packages": [
+    "media_kit-1.2.6",
+    "media_kit_video-2.0.1",
+    "media_kit_libs_windows_video-1.0.11"
+  ]
+}

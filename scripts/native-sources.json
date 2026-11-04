@@ -1,0 +1,6 @@
+[
+  {"name":"libbfio","version":"20260623","status":"alpha","sha256":"95ba2ee1a6365000b454f810e92709fd02bfcac0bba8a9b36512a0e71cc1bf32"},
+  {"name":"libvhdi","version":"20260901","status":"alpha","sha256":"b5c6f10b94bdea5b902fc74a984f0ae4c29b9bb24f81b6318c5b38d60bba24f2"},
+  {"name":"libbde","version":"20260916","status":"alpha","sha256":"22a27c81f7e8a513235c18d642889b690fefd34aa5ee687929103be62246da68"},
+  {"name":"libfsntfs","version":"20260827","status":"experimental","sha256":"72f46ed374c5e61bf24bf840eed10869f593a0d1d9123d07212d0eb336a6eed7"}
+]

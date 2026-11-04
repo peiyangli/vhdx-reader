@@ -1,0 +1,7 @@
+{
+  "release": "chromium/8125",
+  "url": "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F8125/pdfium-win-x64.tgz",
+  "sha256": "9a964261760cff52570aabf038ab346d3a5034dd8b30d0d5fe8861235d356b8b",
+  "archive": "pdfium-win-x64-8125.tgz",
+  "packages": ["pdfrx-2.11.0", "pdfrx_engine-0.9.0", "pdfium_dart-0.4.1", "pdfium_flutter-0.4.1"]
+}

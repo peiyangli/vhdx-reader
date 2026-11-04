@@ -1,0 +1,23 @@
+{
+  "pdfium": {
+    "package": "pdfium_flutter",
+    "package_version": "0.4.1",
+    "archive": "PDFium-chromium-8125-20261029-150241.xcframework.zip",
+    "url": "https://github.com/espresso3389/pdfium-xcframework/releases/download/v158.0.8125.0-20261029-150241/PDFium-chromium-8125-20261029-150241.xcframework.zip",
+    "sha256": "4e83df9e096b98963070a91e1c8fe7252d5c3a80d505e8acfda3f18ac904230d"
+  },
+  "media": {
+    "package": "media_kit_libs_macos_video",
+    "package_version": "1.1.4",
+    "archive": "libmpv-xcframeworks_v0.6.0_macos-universal-video-default.tar.gz",
+    "url": "https://github.com/media-kit/libmpv-darwin-build/releases/download/v0.6.0/libmpv-xcframeworks_v0.6.0_macos-universal-video-default.tar.gz",
+    "sha256": "84d2ad98e046e82c6dc34d8547d76c2afeaee89c0f53032773be8985c95536d6"
+  },
+  "media_ios": {
+    "package": "media_kit_libs_ios_video",
+    "package_version": "1.1.4",
+    "archive": "libmpv-xcframeworks_v0.6.0_ios-universal-video-default.tar.gz",
+    "url": "https://github.com/media-kit/libmpv-darwin-build/releases/download/v0.6.0/libmpv-xcframeworks_v0.6.0_ios-universal-video-default.tar.gz",
+    "sha256": "a95bc18508af26136b8a408341c05b5585d644ec013f00ac07db09d2e28d36ae"
+  }
+}
