@@ -36,6 +36,10 @@ android {
     packaging { jniLibs.useLegacyPackaging = true }
 
     buildTypes {
+        debug {
+            // Keep native integration tests and their vault separate from the preview app.
+            applicationIdSuffix = ".uitest"
+        }
         release {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.

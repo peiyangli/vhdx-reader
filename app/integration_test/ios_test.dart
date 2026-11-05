@@ -8,6 +8,7 @@ import 'native_test.dart' as native;
 import 'test_configuration.dart';
 import 'pdf_test.dart' as pdf;
 import 'media_test.dart' as media;
+import 'cache_settings_test.dart' as cache;
 
 Future<String> document(String name) async {
   final result = await PlatformStorage.channel.invokeListMethod<dynamic>(
@@ -91,4 +92,5 @@ Future<void> main() async {
   native.main();
   pdf.main();
   media.main();
+  cache.main();
 }

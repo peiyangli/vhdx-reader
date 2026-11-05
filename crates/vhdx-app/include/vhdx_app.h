@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI version 6. Call the blocking request function from a non-UI thread.
+/* ABI version 7. Call the blocking request function from a non-UI thread.
    Requests are serialized on a separate Rust worker. It owns all native handles.
    JSON and UTF-8 input length is bounded to 1 MiB. Passwords must never be logged.
    Each successful allocation must be released with vhdx_response_free, not free(). */

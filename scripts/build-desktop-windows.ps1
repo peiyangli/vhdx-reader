@@ -1,4 +1,4 @@
-param([switch]$Offline, [switch]$SkipNative, [string]$FlutterPath)
+param([switch]$Offline, [switch]$SkipNative, [string]$FlutterPath, [switch]$Preview, [string]$PackageDirectory, [string]$ArchivePath)
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\file-sha256.ps1"
 $root = Split-Path $PSScriptRoot -Parent
@@ -19,7 +19,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Flutter dependency resolution failed' }
 & "$PSScriptRoot\prepare-media-windows.ps1" -Offline:$Offline
 & $FlutterPath build windows --release --no-pub
 if ($LASTEXITCODE -ne 0) { throw 'Flutter Windows build failed' }
-$package = "$root\artifacts\gui-windows-x64"
+$package = if ($PackageDirectory) { $PackageDirectory } elseif ($Preview) { "$root\artifacts\gui-windows-ui-preview" } else { "$root\artifacts\gui-windows-x64" }
 [IO.Directory]::CreateDirectory($package) | Out-Null
 Copy-Item "$root\app\build\windows\x64\runner\Release\*" $package -Recurse -Force
 Copy-Item "$root\README.md","$root\THIRD_PARTY.md","$root\LICENSE" $package -Force
@@ -57,7 +57,7 @@ foreach ($dependency in $media.packages) {
 Copy-Item "$PSScriptRoot\media-windows.json" "$package\licenses\" -Force
 Copy-Item "$root\third_party\media" "$package\licenses\" -Recurse -Force
 Write-Output "Desktop package: $package\vhdx_reader.exe"
-$archive = "$root\artifacts\vhdx-reader-desktop-windows-x64.zip"
+$archive = if ($ArchivePath) { $ArchivePath } elseif ($Preview) { "$root\artifacts\vhdx-reader-windows-ui-preview.zip" } else { "$root\artifacts\vhdx-reader-desktop-windows-x64.zip" }
 & "$PSScriptRoot\package-windows.ps1" -Directory $package -Archive $archive
 [IO.File]::WriteAllText("$archive.sha256", "$(Get-ArchiveSha256 $archive)  $([IO.Path]::GetFileName($archive))`n", [Text.Encoding]::ASCII)
 Write-Output "Desktop archive: $archive"

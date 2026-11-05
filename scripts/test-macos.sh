@@ -11,6 +11,12 @@ container="$HOME/Library/Containers/org.vhdxreader.reader/Data"
 launch_pid=''
 fixtures=''
 cleanup() {
+    if [[ -n "$fixtures" && -d "$fixtures" ]]; then
+        mkdir -p "$repo_root/artifacts/macos-validation"
+        for png in "$fixtures/"*.png; do
+            [[ ! -f "$png" ]] || cp "$png" "$repo_root/artifacts/macos-validation/"
+        done
+    fi
     if [[ -n "$launch_pid" ]]; then kill "$launch_pid" 2>/dev/null || true; fi
     if [[ -n "$fixtures" ]]; then rm -rf "$fixtures"; fi
 }
@@ -43,9 +49,5 @@ export VHDX_MEDIA_SCREENSHOT="$fixtures/video.png"
 # The app must exercise its bundled libraries, not an unsandboxed build directory.
 unset VHDX_NATIVE_DIR
 cd "$repo_root/app"
-"$flutter" test
-"$flutter" test integration_test/macos_test.dart -d macos
-mkdir -p "$repo_root/artifacts/macos-validation"
-for name in native pdf video; do
-    if [[ -f "$fixtures/$name.png" ]]; then cp "$fixtures/$name.png" "$repo_root/artifacts/macos-validation/$name.png"; fi
-done
+if [[ "${VHDX_SKIP_WIDGET_TESTS:-0}" != 1 ]]; then "$flutter" test; fi
+"$flutter" test "${VHDX_TEST_TARGET:-integration_test/macos_test.dart}" -d macos

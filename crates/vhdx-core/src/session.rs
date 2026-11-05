@@ -6,6 +6,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
+    cell::RefCell,
     path::Path,
     rc::Rc,
     sync::{
@@ -92,6 +93,20 @@ impl Image {
         credential: Option<&Credential>,
         cache_bytes: usize,
     ) -> Result<Volume> {
+        self.unlock_with_caches(index, credential, cache_bytes, 1024 * 1024)
+    }
+    pub fn unlock_with_caches(
+        &self,
+        index: u32,
+        credential: Option<&Credential>,
+        cache_bytes: usize,
+        ciphertext_cache_bytes: usize,
+    ) -> Result<Volume> {
+        if cache_bytes < 64 * 1024 || ciphertext_cache_bytes < 64 * 1024 {
+            return Err(Error::Invalid(
+                "cache budget must contain at least one page".into(),
+            ));
+        }
         let partition = self
             .info
             .partitions
@@ -106,7 +121,16 @@ impl Image {
         let (source, encryption_method): (Rc<dyn ReadAt>, Option<u16>) = match partition.kind {
             VolumeKind::Ntfs => (source, None),
             VolumeKind::BitLocker => {
-                let decrypted = Decrypted::open(&self.runtime, source, credential)?;
+                // libbde consumes encrypted sectors in small reads. Coalesce them
+                // before crossing the VHDX/provider boundary (especially costly
+                // for external or network-backed descriptors). This separate
+                // cache contains ciphertext; plaintext has its own budget below.
+                let encrypted = Rc::new(CachedReader::new(
+                    source,
+                    64 * 1024,
+                    ciphertext_cache_bytes,
+                )?);
+                let decrypted = Decrypted::open(&self.runtime, encrypted, credential)?;
                 let method = decrypted.encryption_method;
                 (decrypted, Some(method))
             }
@@ -124,12 +148,20 @@ impl Image {
         Ok(Volume {
             fs,
             encryption_method,
+            listing: RefCell::new(None),
         })
     }
 }
 pub struct Volume {
     fs: Rc<Ntfs>,
     pub encryption_method: Option<u16>,
+    // Only the in-progress directory is retained, never a growing path cache.
+    listing: RefCell<Option<Listing>>,
+}
+struct Listing {
+    path: String,
+    directory: Entry,
+    total: u32,
 }
 #[derive(Serialize, Debug)]
 pub struct FileInfo {
@@ -137,6 +169,7 @@ pub struct FileInfo {
     pub directory: bool,
     pub size: u64,
     pub attributes: u32,
+    pub modified_unix_ms: Option<i64>,
 }
 #[derive(Serialize)]
 pub struct DirectoryPage {
@@ -158,8 +191,21 @@ impl Volume {
                 "directory page size must be 1..10000".into(),
             ));
         }
-        let directory = self.fs.entry(path)?;
-        let total = directory.child_count()?;
+        let previous = self.listing.borrow_mut().take();
+        let listing = match previous {
+            Some(listing) if start != 0 && listing.path == path => listing,
+            previous => {
+                drop(previous);
+                let directory = self.fs.entry(path)?;
+                let total = directory.child_count()?;
+                Listing {
+                    path: path.into(),
+                    directory,
+                    total,
+                }
+            }
+        };
+        let total = listing.total;
         if start > total {
             return Err(Error::Invalid(
                 "directory offset exceeds entry count".into(),
@@ -169,14 +215,18 @@ impl Volume {
         let mut entries = Vec::with_capacity((end - start) as usize);
         for i in start..end {
             cancel.check()?;
-            let entry = directory.child(i)?;
+            let entry = listing.directory.child(i)?;
             let directory = entry.is_directory()?;
             entries.push(FileInfo {
                 name: entry.name()?,
                 directory,
                 size: if directory { 0 } else { entry.size()? },
                 attributes: entry.flags()?,
+                modified_unix_ms: entry.modified_unix_ms()?,
             });
+        }
+        if end < total {
+            *self.listing.borrow_mut() = Some(listing);
         }
         Ok(DirectoryPage {
             entries,

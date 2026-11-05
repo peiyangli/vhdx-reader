@@ -769,6 +769,28 @@ impl Ntfs {
     }
 }
 impl Entry {
+    pub fn modified_unix_ms(&self) -> Result<Option<i64>> {
+        unsafe {
+            let f = self
+                .object
+                .api
+                .symbol::<unsafe extern "C" fn(P, *mut u64, E) -> c_int>(
+                    "file_entry_get_modification_time",
+                )?;
+            let mut ticks = 0;
+            let mut error = ptr::null_mut();
+            let found = self.object.api.check(
+                f(self.object.raw, &mut ticks, &mut error),
+                error,
+                "file modification time",
+            )?;
+            if found == 0 || ticks == 0 {
+                return Ok(None);
+            }
+            // NTFS FILETIME: 100 ns ticks since 1601-01-01, converted to Unix ms.
+            Ok(Some((ticks / 10_000) as i64 - 11_644_473_600_000))
+        }
+    }
     pub fn flags(&self) -> Result<u32> {
         self.object.u32("file_entry_get_file_attribute_flags")
     }

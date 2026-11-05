@@ -1,6 +1,7 @@
 #include "flutter_window.h"
 
 #include <optional>
+#include <flutter/standard_method_codec.h>
 
 #include "flutter/generated_plugin_registrant.h"
 
@@ -27,6 +28,39 @@ bool FlutterWindow::OnCreate() {
   RegisterPlugins(flutter_controller_->engine());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
+  // Keep the system sizing frame and window commands; Flutter draws the title row.
+  const auto hwnd = GetHandle();
+  SetWindowLongPtr(hwnd, GWL_STYLE,
+                   GetWindowLongPtr(hwnd, GWL_STYLE) & ~WS_CAPTION);
+  SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+  window_channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+      flutter_controller_->engine()->messenger(), "vhdx_reader/window",
+      &flutter::StandardMethodCodec::GetInstance());
+  window_channel_->SetMethodCallHandler(
+      [hwnd](const auto& call, auto result) {
+        const auto& action = call.method_name();
+        if (action == "drag") {
+          result->Success();
+          ReleaseCapture();
+          POINT cursor{};
+          GetCursorPos(&cursor);
+          PostMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION,
+                      MAKELPARAM(cursor.x, cursor.y));
+        } else if (action == "minimize") {
+          ShowWindow(hwnd, SW_MINIMIZE);
+          result->Success();
+        } else if (action == "maximize") {
+          ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+          result->Success();
+        } else if (action == "close") {
+          result->Success();
+          PostMessage(hwnd, WM_CLOSE, 0, 0);
+        } else {
+          result->NotImplemented();
+        }
+      });
+
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
   });
@@ -40,6 +74,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  window_channel_ = nullptr;
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }

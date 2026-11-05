@@ -1,5 +1,7 @@
 package org.vhdxreader.vhdx_reader
 
+import android.content.pm.ActivityInfo
+import android.os.Bundle
 import android.app.Activity
 import android.content.Intent
 import android.net.Uri
@@ -16,6 +18,26 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : FlutterActivity() {
+    private val shakeRotation by lazy { ShakeRotationController(this) }
+    override fun onResume() { super.onResume(); shakeRotation.resume() }
+    override fun onPause() { shakeRotation.pause(); super.onPause() }
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        shakeRotation.refresh()
+    }
+
+    private fun applyScreenDirection(value: String) {
+        requestedOrientation = when (value) {
+            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            else -> ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+        }
+    }
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        applyScreenDirection(getSharedPreferences("reader_display", MODE_PRIVATE)
+            .getString("direction", "automatic") ?: "automatic")
+    }
     private var pending: MethodChannel.Result? = null
     private var pickingExport = false
     private val io = Executors.newSingleThreadExecutor()
@@ -51,6 +73,53 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.vhdxreader/storage")
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "screenDirection" -> result.success(getSharedPreferences("reader_display", MODE_PRIVATE)
+                        .getString("direction", "automatic"))
+                    "setScreenDirection" -> {
+                        val value = call.argument<String>("value")
+                        if (value !in listOf("automatic", "portrait", "landscape")) {
+                            result.error("direction", "无效的屏幕方向。", null)
+                        } else if (!getSharedPreferences("reader_display", MODE_PRIVATE)
+                            .edit().putString("direction", value).commit()) {
+                            result.error("direction", "无法保存屏幕方向。", null)
+                        } else {
+                            applyScreenDirection(value!!)
+                            shakeRotation.refresh(clearOverride = true)
+                            result.success(null)
+                        }
+                    }
+                    "shakeRotation" -> result.success(mapOf(
+                        "enabled" to getSharedPreferences("reader_display", MODE_PRIVATE)
+                            .getBoolean("shake_rotation", false),
+                        "available" to shakeRotation.available))
+                    "setShakeRotation" -> {
+                        val value = call.argument<Boolean>("value")
+                        if (value == null || (value && !shakeRotation.available)) {
+                            result.error("shake", "设备不支持摇晃旋转。", null)
+                        } else if (!getSharedPreferences("reader_display", MODE_PRIVATE).edit()
+                            .putBoolean("shake_rotation", value).commit()) {
+                            result.error("shake", "无法保存摇晃旋转设置。", null)
+                        } else {
+                            shakeRotation.refresh(clearOverride = true)
+                            result.success(null)
+                        }
+                    }
+                    "debugShakeChecks" -> if (BuildConfig.DEBUG) {
+                        try {
+                            result.success(Class.forName("org.vhdxreader.vhdx_reader.ShakeRotationChecks")
+                                .getMethod("run").invoke(null))
+                        } catch (error: Exception) {
+                            result.error("shake_test", (error.cause ?: error).toString(), null)
+                        }
+                    } else result.notImplemented()
+                    "debugShakeSamples" -> if (BuildConfig.DEBUG) {
+                        val samples = call.argument<List<List<Number>>>("samples") ?: emptyList()
+                        result.success(shakeRotation.debugSamples(samples))
+                    } else result.notImplemented()
+                    "debugRotation" -> if (BuildConfig.DEBUG) {
+                        @Suppress("DEPRECATION")
+                        result.success(windowManager.defaultDisplay.rotation)
+                    } else result.notImplemented()
                     "nativeDirectory" -> result.success(applicationInfo.nativeLibraryDir)
                     "chooseImages", "chooseCredential", "createExport" -> {
                         if (pending != null) { result.error("busy", "已有文件选择窗口。", null); return@setMethodCallHandler }

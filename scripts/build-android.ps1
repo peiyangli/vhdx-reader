@@ -2,6 +2,7 @@ param(
     [switch]$SkipNative,
     [switch]$Offline,
     [switch]$DebugBuild,
+    [switch]$Preview,
     [string]$AndroidSdk = "$env:LOCALAPPDATA\Android\Sdk",
     [string]$MsysRoot = 'C:\msys64',
     [string]$JavaHome = 'C:\Program Files\Android\Android Studio\jbr'
@@ -110,7 +111,8 @@ $lines = if (Test-Path $properties) { @(Get-Content $properties | Where-Object {
 & $flutter build apk "--$mode" --target-platform android-arm64
 if ($LASTEXITCODE -ne 0) { throw 'Android APK build failed' }
 [IO.Directory]::CreateDirectory("$root\artifacts") | Out-Null
-$output = "$root\artifacts\vhdx-reader-android-arm64-$mode.apk"
+$artifactName = if ($Preview -and -not $DebugBuild) { "ui-preview" } else { $mode }
+$output = "$root\artifacts\vhdx-reader-android-arm64-$artifactName.apk"
 & "$PSScriptRoot\verify-android-apk.ps1" -Apk "$root\app\build\app\outputs\flutter-apk\app-$mode.apk"
 Copy-Item "$root\app\build\app\outputs\flutter-apk\app-$mode.apk" $output -Force
 $outputHash = Get-ArchiveSha256 $output

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'platform_storage.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'backend.dart';
 import 'preview.dart';
@@ -11,10 +12,25 @@ import 'pdf_preview.dart';
 import 'range_reader.dart';
 import 'media_preview.dart';
 import 'credential_manager.dart';
+import 'file_browser.dart';
+import 'window_chrome.dart';
+import 'reader_navigation.dart';
+import 'screen_layout.dart';
+import 'cache_settings.dart';
 
-void main(List<String> args) {
+Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(_Bootstrap(initialImage: args.isEmpty ? null : args.first));
+  if (Platform.isAndroid || Platform.isIOS) {
+    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    SystemChrome.setSystemUIOverlayStyle(readerSystemStyle);
+  }
+  final cacheSettings = await const CacheSettingsStore().load();
+  runApp(
+    _Bootstrap(
+      initialImage: args.isEmpty ? null : args.first,
+      cacheSettings: cacheSettings,
+    ),
+  );
 }
 
 ThemeData readerTheme() => ThemeData(
@@ -23,7 +39,7 @@ ThemeData readerTheme() => ThemeData(
     seedColor: const Color(0xff2563eb),
     brightness: Brightness.light,
   ),
-  scaffoldBackgroundColor: const Color(0xfff5f7fb),
+  scaffoldBackgroundColor: Colors.white,
   fontFamily: 'Microsoft YaHei UI',
   inputDecorationTheme: InputDecorationTheme(
     filled: true,
@@ -46,8 +62,9 @@ ThemeData readerTheme() => ThemeData(
 );
 
 class _Bootstrap extends StatefulWidget {
-  const _Bootstrap({this.initialImage});
+  const _Bootstrap({this.initialImage, required this.cacheSettings});
   final String? initialImage;
+  final CacheSettings cacheSettings;
   @override
   State<_Bootstrap> createState() => _BootstrapState();
 }
@@ -62,6 +79,7 @@ class _BootstrapState extends State<_Bootstrap> {
         return ReaderApp(
           backend: snapshot.data!,
           initialImage: widget.initialImage,
+          cacheSettings: widget.cacheSettings,
         );
       }
       return MaterialApp(
@@ -99,7 +117,13 @@ class ReaderApp extends StatelessWidget {
     this.initialImage,
     this.createBackend,
     this.pickImages,
+    this.platform,
+    this.cacheSettings = const CacheSettings(),
+    this.saveCacheSettings,
   });
+  final CacheSettings cacheSettings;
+  final Future<void> Function(CacheSettings)? saveCacheSettings;
+  final TargetPlatform? platform;
   final ReaderBackend backend;
   final String? initialImage;
   final Future<ReaderBackend> Function()? createBackend;
@@ -108,7 +132,7 @@ class ReaderApp extends StatelessWidget {
   Widget build(BuildContext context) => MaterialApp(
     title: 'VHDX Reader',
     debugShowCheckedModeBanner: false,
-    theme: readerTheme(),
+    theme: readerTheme().copyWith(platform: platform),
     locale: const Locale('zh', 'CN'),
     supportedLocales: const [Locale('zh', 'CN'), Locale('en')],
     localizationsDelegates: GlobalMaterialLocalizations.delegates,
@@ -117,6 +141,9 @@ class ReaderApp extends StatelessWidget {
       initialImage: initialImage,
       createBackend: createBackend ?? NativeBackend.start,
       pickImages: pickImages,
+      platform: platform ?? readerTheme().platform,
+      cacheSettings: cacheSettings,
+      saveCacheSettings: saveCacheSettings ?? const CacheSettingsStore().save,
     ),
   );
 }
@@ -135,7 +162,13 @@ class _ReaderWorkspace extends StatefulWidget {
     required this.createBackend,
     this.initialImage,
     this.pickImages,
+    required this.platform,
+    required this.cacheSettings,
+    required this.saveCacheSettings,
   });
+  final CacheSettings cacheSettings;
+  final Future<void> Function(CacheSettings) saveCacheSettings;
+  final TargetPlatform platform;
   final ReaderBackend backend;
   final String? initialImage;
   final Future<ReaderBackend> Function() createBackend;
@@ -151,6 +184,103 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
   int _active = 0;
   int _nextId = 1;
   bool _opening = false;
+  bool _settingsOpen = false;
+  bool _showSystem = false;
+  ScreenDirection _direction = ScreenDirection.automatic;
+  bool _directionBusy = true;
+  bool _shakeEnabled = false;
+  bool _shakeAvailable = false;
+  bool _shakeBusy = false;
+  late CacheSettings _cacheSettings = widget.cacheSettings;
+  bool _cacheSettingsBusy = false;
+
+  Future<void> _setCacheSettings(CacheSettings value) async {
+    if (_cacheSettingsBusy) return;
+    setState(() => _cacheSettingsBusy = true);
+    try {
+      await widget.saveCacheSettings(value);
+      if (!mounted) return;
+      setState(() => _cacheSettings = value);
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(const SnackBar(content: Text('已保存，重新解锁或重新打开镜像后生效。')));
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+          ..clearSnackBars()
+          ..showSnackBar(const SnackBar(content: Text('无法保存缓存设置，请重试。')));
+      }
+    } finally {
+      if (mounted) setState(() => _cacheSettingsBusy = false);
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.platform == TargetPlatform.android ||
+        widget.platform == TargetPlatform.iOS) {
+      unawaited(_loadDirection());
+    } else {
+      _directionBusy = false;
+    }
+  }
+
+  Future<void> _loadDirection() async {
+    try {
+      final value = await ScreenDirection.load();
+      await value.apply();
+      if (mounted) setState(() => _direction = value);
+      if (widget.platform != TargetPlatform.android) return;
+      final shake = await ShakeRotation.load();
+      if (mounted) {
+        setState(() {
+          _shakeEnabled = shake['enabled'] == true;
+          _shakeAvailable = shake['available'] == true;
+        });
+      }
+    } on MissingPluginException {
+      // Widget tests and platforms without the Android preferences bridge.
+    } on PlatformException {
+      // Keep the default; a subsequent explicit save reports failures.
+    } finally {
+      if (mounted) setState(() => _directionBusy = false);
+    }
+  }
+
+  Future<void> _setDirection(ScreenDirection value) async {
+    if (_directionBusy) return;
+    setState(() => _directionBusy = true);
+    try {
+      await value.save();
+      if (mounted) setState(() => _direction = value);
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('无法保存屏幕方向，请重试。')));
+      }
+    } finally {
+      if (mounted) setState(() => _directionBusy = false);
+    }
+  }
+
+  Future<void> _setShakeRotation(bool value) async {
+    if (_shakeBusy) return;
+    setState(() => _shakeBusy = true);
+    try {
+      await ShakeRotation.save(value);
+      if (mounted) setState(() => _shakeEnabled = value);
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('无法保存摇晃旋转设置，请重试。')));
+      }
+    } finally {
+      if (mounted) setState(() => _shakeBusy = false);
+    }
+  }
 
   String _identity(String path) {
     if (PlatformStorage.isDocument(path)) return path;
@@ -243,127 +373,97 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
     super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) => Scaffold(
-    body: SafeArea(
-      child: Column(
-        children: [
-          Material(
-            color: const Color(0xffe8edf4),
-            child: SizedBox(
-              height: 48,
-              child: Row(
-                children: [
-                  Expanded(
-                    child: ListView.builder(
-                      scrollDirection: Axis.horizontal,
-                      itemCount: _tabs.length,
-                      itemBuilder: (context, index) {
-                        final tab = _tabs[index];
-                        final label = tab.path == null
-                            ? '开始'
-                            : PlatformStorage.displayName(tab.path!);
-                        return Padding(
-                          padding: const EdgeInsets.fromLTRB(4, 4, 0, 0),
-                          child: Material(
-                            color: index == _active
-                                ? Colors.white
-                                : const Color(0xffe8edf4),
-                            borderRadius: const BorderRadius.vertical(
-                              top: Radius.circular(8),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                TextButton.icon(
-                                  key: ValueKey('image-tab-${tab.id}'),
-                                  onPressed: () =>
-                                      setState(() => _active = index),
-                                  icon: Icon(
-                                    tab.busy
-                                        ? Icons.hourglass_top
-                                        : Icons.disc_full_outlined,
-                                    size: 16,
-                                  ),
-                                  label: Tooltip(
-                                    message: tab.path ?? '开始',
-                                    child: ConstrainedBox(
-                                      constraints: const BoxConstraints(
-                                        maxWidth: 210,
-                                      ),
-                                      child: Text(
-                                        label,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                                if (tab.path != null)
-                                  IconButton(
-                                    key: ValueKey('close-tab-${tab.id}'),
-                                    tooltip: '关闭 $label',
-                                    onPressed: tab.busy || _opening
-                                        ? null
-                                        : () => _closeTab(tab),
-                                    icon: const Icon(Icons.close, size: 16),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: '添加镜像（可多选）',
-                    onPressed: _opening ? null : _openImages,
-                    icon: const Icon(Icons.add),
-                  ),
-                  IconButton(
-                    key: const Key('credential-manager'),
-                    tooltip: '已保存的解锁信息',
-                    onPressed: _opening || _tabs.any((tab) => tab.busy)
-                        ? null
-                        : () async {
-                            final backend = _tabs[_active].backend;
-                            backend.beginOperation();
-                            await showDialog<void>(
-                              context: context,
-                              builder: (_) =>
-                                  CredentialManager(backend: backend),
-                            );
-                          },
-                    icon: const Icon(Icons.key_outlined),
-                  ),
-                ],
+  Future<void> _credentials() async {
+    if (_opening || _tabs.any((tab) => tab.busy)) return;
+    final backend = _tabs[_active].backend;
+    backend.beginOperation();
+    await showDialog<void>(
+      context: context,
+      builder: (_) => CredentialManager(backend: backend),
+    );
+  }
+
+  Widget _homes() => IndexedStack(
+    index: _active,
+    children: [
+      for (final tab in _tabs)
+        ReaderHome(
+          key: ValueKey(tab.id),
+          backend: tab.backend,
+          platform: widget.platform,
+          cacheSettings: _cacheSettings,
+          initialImage: tab.path,
+          active: tab == _tabs[_active] && !_settingsOpen,
+          onSettings: () => setState(() => _settingsOpen = true),
+          showSystem: _showSystem,
+          images: {
+            for (final image in _tabs)
+              if (image.path != null) image.id: image.path!,
+          },
+          activeImageId: tab.id,
+          workspaceBusy: _opening || _tabs.any((tab) => tab.busy),
+          onSelectImage: (id) {
+            final index = _tabs.indexWhere((image) => image.id == id);
+            if (index >= 0) setState(() => _active = index);
+          },
+          onCredentials: _credentials,
+          onShowSystem: (value) => setState(() => _showSystem = value),
+          onOpenImages: _openImages,
+          onClose: () => _closeTab(tab),
+          onBusyChanged: (busy) {
+            if (mounted && _tabs.contains(tab)) setState(() => tab.busy = busy);
+          },
+        ),
+    ],
+  );
+
+  Widget _workspace() => PopScope(
+    canPop: !_settingsOpen,
+    onPopInvokedWithResult: (didPop, result) {
+      if (!didPop && _settingsOpen) {
+        setState(() => _settingsOpen = false);
+      }
+    },
+    child: AnnotatedRegion<SystemUiOverlayStyle>(
+      value: readerSystemStyle,
+      child: ColoredBox(
+        color: Colors.white,
+        child: IndexedStack(
+          index: _settingsOpen ? 1 : 0,
+          children: [
+            _homes(),
+            if (_settingsOpen)
+              ReaderSettingsPage(
+                key: const Key('reader-settings-page'),
+                cacheSettings: _cacheSettings,
+                onCacheSettings: _cacheSettingsBusy ? null : _setCacheSettings,
+                windowsChrome: widget.platform == TargetPlatform.windows,
+                direction:
+                    widget.platform == TargetPlatform.android ||
+                        widget.platform == TargetPlatform.iOS
+                    ? _direction
+                    : null,
+                onDirection: _directionBusy ? null : _setDirection,
+                showShake: widget.platform == TargetPlatform.android,
+                shakeEnabled: _shakeEnabled,
+                shakeAvailable: _shakeAvailable,
+                onShake: _directionBusy || _shakeBusy || !_shakeAvailable
+                    ? null
+                    : _setShakeRotation,
+                showSystem: _showSystem,
+                busy: _opening || _tabs.any((tab) => tab.busy),
+                onShowSystem: (value) => setState(() => _showSystem = value),
+                onCredentials: _credentials,
+                onBack: () => setState(() => _settingsOpen = false),
               ),
-            ),
-          ),
-          Expanded(
-            child: IndexedStack(
-              index: _active,
-              children: [
-                for (final tab in _tabs)
-                  ReaderHome(
-                    key: ValueKey(tab.id),
-                    backend: tab.backend,
-                    initialImage: tab.path,
-                    active: tab == _tabs[_active],
-                    onOpenImages: _openImages,
-                    onClose: () => _closeTab(tab),
-                    onBusyChanged: (busy) {
-                      if (mounted && _tabs.contains(tab)) {
-                        setState(() => tab.busy = busy);
-                      }
-                    },
-                  ),
-              ],
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     ),
   );
+
+  @override
+  Widget build(BuildContext context) => _workspace();
 }
 
 class ReaderHome extends StatefulWidget {
@@ -375,20 +475,40 @@ class ReaderHome extends StatefulWidget {
     required this.onClose,
     required this.onBusyChanged,
     required this.active,
+    required this.platform,
+    this.showSystem = false,
+    this.workspaceBusy = false,
+    this.images = const {},
+    this.activeImageId,
+    this.onSelectImage,
+    this.onCredentials,
+    this.onSettings,
+    this.onShowSystem,
+    this.cacheSettings = const CacheSettings(),
   });
+  final CacheSettings cacheSettings;
+  final TargetPlatform platform;
   final ReaderBackend backend;
   final String? initialImage;
   final Future<void> Function() onOpenImages;
   final Future<void> Function() onClose;
   final ValueChanged<bool> onBusyChanged;
   final bool active;
+  final bool showSystem;
+  final bool workspaceBusy;
+  final Map<int, String> images;
+  final int? activeImageId;
+  final ValueChanged<int>? onSelectImage;
+  final VoidCallback? onSettings;
+  final Future<void> Function()? onCredentials;
+  final ValueChanged<bool>? onShowSystem;
   @override
   State<ReaderHome> createState() => _ReaderHomeState();
 }
 
 class _ReaderHomeState extends State<ReaderHome> {
   final _password = TextEditingController();
-  final _filter = TextEditingController();
+  final _desktopFocus = FocusNode();
   Map<String, dynamic>? _image;
   String? _imagePath;
   int? _partition;
@@ -396,6 +516,9 @@ class _ReaderHomeState extends State<ReaderHome> {
   bool _busy = false;
   bool _showPassword = false;
   bool _showSystem = false;
+  bool _grid = false;
+  FileSort _sort = FileSort.name;
+  bool _descending = false;
   String _mode = 'password';
   String? _credentialFile;
   bool _remember = false;
@@ -408,13 +531,15 @@ class _ReaderHomeState extends State<ReaderHome> {
   String? _error;
   String _path = '/';
   List<Map<String, dynamic>> _entries = [];
-  int? _nextIndex;
   final _shell = GlobalKey<ScaffoldState>();
+  bool _drawerOpen = false;
   Map<String, dynamic>? _selected;
   PreviewData? _preview;
+  int _previewRevision = 0;
   @override
   void initState() {
     super.initState();
+    _showSystem = widget.showSystem;
     if (widget.initialImage != null) {
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => _open(widget.initialImage!),
@@ -423,11 +548,29 @@ class _ReaderHomeState extends State<ReaderHome> {
   }
 
   @override
+  void didUpdateWidget(covariant ReaderHome oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.active && !oldWidget.active) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _desktopFocus.requestFocus();
+      });
+    }
+    if (oldWidget.showSystem != widget.showSystem) {
+      _showSystem = widget.showSystem;
+      if (_unlocked) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) unawaited(_run('正在读取目录…', () => _load(_path)));
+        });
+      }
+    }
+  }
+
+  @override
   void dispose() {
     _preview?.dispose();
     _password.clear();
     _password.dispose();
-    _filter.dispose();
+    _desktopFocus.dispose();
     super.dispose();
   }
 
@@ -450,9 +593,7 @@ class _ReaderHomeState extends State<ReaderHome> {
     _entries = [];
     _selected = null;
     _preview = null;
-    _nextIndex = null;
     _path = '/';
-    _filter.clear();
   }
 
   Future<void> _run(String status, Future<void> Function() operation) async {
@@ -532,6 +673,7 @@ class _ReaderHomeState extends State<ReaderHome> {
         'op': 'unlock',
         'partition': index,
         'mode': 'none',
+        'cache': widget.cacheSettings.toJson(),
       });
       if (!mounted) return;
       setState(() => _unlocked = true);
@@ -567,6 +709,7 @@ class _ReaderHomeState extends State<ReaderHome> {
       await widget.backend.request({
         'op': 'unlock_saved',
         'partition': _partition,
+        'cache': widget.cacheSettings.toJson(),
       });
       if (!mounted) return;
       setState(() {
@@ -596,6 +739,7 @@ class _ReaderHomeState extends State<ReaderHome> {
       'op': 'unlock',
       'partition': _partition,
       'mode': _mode,
+      'cache': widget.cacheSettings.toJson(),
       'remember': _remember && _vaultAvailable,
       'label': '${_leaf(_imagePath ?? '')} · 分区 $_partition',
       if (_credentialFile != null)
@@ -633,42 +777,70 @@ class _ReaderHomeState extends State<ReaderHome> {
     }
   }
 
-  Future<void> _load(String path, {bool append = false}) async {
-    final data = await widget.backend.request({
-      'op': 'list',
-      'path': path,
-      'start': append ? _nextIndex : 0,
-      'limit': 200,
-      'show_system': _showSystem,
-    });
-    if (!mounted) return;
-    final entries = (data['entries'] as List)
-        .map((e) => Map<String, dynamic>.from(e as Map))
-        .toList();
+  Future<void> _load(String path) async {
+    final entries = <Map<String, dynamic>>[];
+    int? next = 0;
+    do {
+      final data = await widget.backend.request({
+        'op': 'list',
+        'path': path,
+        'start': next,
+        'limit': 200,
+        'show_system': _showSystem,
+      });
+      if (!mounted) return;
+      entries.addAll(
+        (data['entries'] as List).map(
+          (e) => Map<String, dynamic>.from(e as Map),
+        ),
+      );
+      final previous = next;
+      next = data['next_index'] as int?;
+      if (next != null && next <= previous!) {
+        throw ReaderFailure('invalid_pagination', '目录读取未能继续，请刷新重试。');
+      }
+      if (next != null) {
+        setState(() => _status = '正在读取目录… ${entries.length} 项');
+      }
+    } while (next != null);
     setState(() {
       _path = path;
-      _entries = append ? [..._entries, ...entries] : entries;
-      _nextIndex = data['next_index'] as int?;
-      if (!append) {
-        _preview?.dispose();
-        _selected = null;
-        _preview = null;
-        _filter.clear();
-      }
+      _entries = entries;
+      _preview?.dispose();
+      _selected = null;
+      _preview = null;
     });
   }
 
-  Future<void> _select(Map<String, dynamic> entry) async {
+  Map<String, dynamic>? _videoNeighbour(int step) => adjacentVideo(
+    _entries,
+    _selected?['name'] as String?,
+    step,
+    _sort,
+    _descending,
+  );
+
+  Future<void> _select(
+    Map<String, dynamic> entry, {
+    bool replaceVideo = false,
+  }) async {
+    if (_busy) return;
     if (entry['directory'] == true) {
       await _run('正在读取目录…', () => _load(_join(entry['name'] as String)));
       return;
     }
+    final previous = replaceVideo ? _preview : null;
+    final revision = ++_previewRevision;
     await _run('正在读取文件…', () async {
-      setState(() {
-        _preview?.dispose();
-        _selected = entry;
-        _preview = null;
-      });
+      if (previous != null) {
+        await previous.media?.suspend();
+      } else {
+        setState(() {
+          _preview?.dispose();
+          _selected = entry;
+          _preview = null;
+        });
+      }
       final name = entry['name'] as String;
       final size = entry['size'] as int;
       Uint8List? bytes;
@@ -677,9 +849,12 @@ class _ReaderHomeState extends State<ReaderHome> {
       MediaPreviewSource? media;
       if (isVideo(name)) {
         media = await MediaPreviewSource.open(widget.backend, _join(name));
-        if (!mounted) {
+        if (!mounted || revision != _previewRevision) {
           media.dispose();
           return;
+        }
+        if (previous?.media != null) {
+          await media.setVolume(previous!.media!.volume);
         }
       }
       if (extension(name) == 'pdf') {
@@ -731,40 +906,27 @@ class _ReaderHomeState extends State<ReaderHome> {
           }
         }
       }
-      if (!mounted) return;
-      setState(
-        () => _preview = PreviewData(
+      if (!mounted || revision != _previewRevision) {
+        media?.dispose();
+        pdf?.dispose();
+        return;
+      }
+      setState(() {
+        _selected = entry;
+        _preview = PreviewData(
           name,
           size,
           bytes,
           notice: notice,
           pdf: pdf,
           media: media,
-        ),
-      );
+        );
+      });
+      previous?.dispose();
     });
-    if (mounted &&
-        widget.active &&
-        _preview != null &&
-        _preview!.pdf == null &&
-        _preview!.media == null &&
-        MediaQuery.sizeOf(context).width < 1080) {
-      await showDialog<void>(
-        context: context,
-        builder: (context) => Dialog(
-          child: SizedBox(
-            width: 620,
-            height: 550,
-            child: PreviewPane(
-              data: _preview,
-              onExport: () {
-                Navigator.pop(context);
-                unawaited(_export());
-              },
-            ),
-          ),
-        ),
-      );
+    // A failed replacement leaves the previous video paused and usable.
+    if (mounted && previous != null && identical(_preview, previous)) {
+      previous.media?.setVisible(widget.active);
     }
   }
 
@@ -823,426 +985,58 @@ class _ReaderHomeState extends State<ReaderHome> {
   }
 
   @override
-  Widget build(BuildContext context) {
-    final wide = MediaQuery.sizeOf(context).width >= 1080;
-    final size = MediaQuery.sizeOf(context);
-    final compact = size.width < 700 || size.height < 550;
-    return Scaffold(
-      key: _shell,
-      drawer: compact
-          ? Drawer(
-              child: SafeArea(
-                child: LayoutBuilder(
-                  builder: (context, constraints) => SingleChildScrollView(
-                    child: SizedBox(
-                      height: constraints.maxHeight < 650
-                          ? 650
-                          : constraints.maxHeight,
-                      child: _sidebar(),
-                    ),
-                  ),
-                ),
-              ),
-            )
-          : null,
-      body: Row(
-        children: [
-          if (!compact) SizedBox(width: wide ? 238 : 200, child: _sidebar()),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Container(
-                  height: compact ? 68 : 84,
-                  padding: EdgeInsets.symmetric(horizontal: compact ? 8 : 28),
-                  color: Colors.white,
-                  child: Row(
-                    children: [
-                      if (compact)
-                        Builder(
-                          builder: (context) => IconButton(
-                            tooltip: '镜像和分区',
-                            icon: const Icon(Icons.menu),
-                            onPressed: () => Scaffold.of(context).openDrawer(),
-                          ),
-                        ),
-                      Expanded(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              '文件浏览',
-                              style: TextStyle(
-                                fontSize: 23,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              _image == null
-                                  ? '从你的虚拟磁盘开始'
-                                  : '${formatBytes(_image!['virtual_size'] as int)} · ${_image!['disk_type'] == 'dynamic' ? '动态磁盘' : '固定磁盘'}',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 12,
-                                color: Color(0xff64748b),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      OutlinedButton.icon(
-                        onPressed: _busy ? null : _chooseImage,
-                        icon: const Icon(Icons.add, size: 18),
-                        label: const Text('打开镜像'),
-                      ),
-                    ],
-                  ),
-                ),
-                if (_busy)
-                  const LinearProgressIndicator(minHeight: 2)
-                else
-                  const Divider(height: 2, color: Color(0xffe8edf4)),
-                if (_error != null)
-                  Container(
-                    margin: const EdgeInsets.fromLTRB(24, 16, 24, 0),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      color: const Color(0xfffff1f2),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Row(
-                      children: [
-                        const Icon(
-                          Icons.info_outline,
-                          size: 20,
-                          color: Color(0xffbe123c),
-                        ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(
-                            _error!,
-                            style: const TextStyle(color: Color(0xff9f1239)),
-                          ),
-                        ),
-                        IconButton(
-                          onPressed: () => setState(() => _error = null),
-                          icon: const Icon(Icons.close, size: 18),
-                        ),
-                      ],
-                    ),
-                  ),
-                Expanded(
-                  child: _image == null
-                      ? _welcome()
-                      : !_unlocked
-                      ? _unlockView()
-                      : (_preview?.pdf != null || _preview?.media != null)
-                      ? PreviewPane(
-                          data: _preview,
-                          active: widget.active,
-                          onExport: _busy ? null : _export,
-                          onBack: () => setState(() {
-                            _preview?.dispose();
-                            _preview = null;
-                          }),
-                        )
-                      : Row(
-                          children: [
-                            Expanded(child: _fileList()),
-                            if (wide) ...[
-                              const VerticalDivider(
-                                width: 1,
-                                color: Color(0xffe8edf4),
-                              ),
-                              SizedBox(
-                                width: 350,
-                                child: PreviewPane(
-                                  data: _preview,
-                                  onExport: _busy ? null : _export,
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
-                ),
-                Container(
-                  height: 38,
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
-                  decoration: const BoxDecoration(
-                    color: Colors.white,
-                    border: Border(top: BorderSide(color: Color(0xffe8edf4))),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(
-                        _busy
-                            ? Icons.hourglass_top
-                            : Icons.check_circle_outline,
-                        size: 14,
-                        color: const Color(0xff64748b),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          _busy
-                              ? _status
-                              : _unlocked
-                              ? '${_entries.length} 个已加载项目'
-                              : '就绪',
-                          style: const TextStyle(
-                            fontSize: 12,
-                            color: Color(0xff64748b),
-                          ),
-                        ),
-                      ),
-                      if (_busy)
-                        TextButton(
-                          onPressed: () {
-                            widget.backend.cancel();
-                            setState(() => _status = '正在取消…');
-                          },
-                          child: const Text('取消'),
-                        ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _sidebar() => Container(
-    color: const Color(0xff142339),
-    padding: const EdgeInsets.fromLTRB(20, 28, 20, 20),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Row(
-          children: [
-            Icon(Icons.storage_rounded, color: Color(0xff8eb5ff), size: 28),
-            SizedBox(width: 10),
-            Expanded(
-              child: FittedBox(
-                fit: BoxFit.scaleDown,
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  'VHDX Reader',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
-                    color: Colors.white,
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        const Padding(
-          padding: EdgeInsets.only(left: 38),
-          child: Text(
-            '随身磁盘 · 只读浏览',
-            style: TextStyle(fontSize: 11, color: Color(0xff94a8c3)),
-          ),
-        ),
-        const SizedBox(height: 38),
-        const Text(
-          '当前镜像',
-          style: TextStyle(
-            fontSize: 11,
-            color: Color(0xff94a8c3),
-            letterSpacing: 1,
-          ),
-        ),
-        const SizedBox(height: 14),
-        if (_image == null)
-          const Text(
-            '尚未打开镜像',
-            style: TextStyle(color: Color(0xffb6c5da), fontSize: 13),
-          )
-        else ...[
-          Container(
-            padding: const EdgeInsets.all(14),
-            decoration: BoxDecoration(
-              color: const Color(0xff223650),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Icon(Icons.disc_full_outlined, color: Color(0xff9fc1ff)),
-                const SizedBox(height: 12),
-                Text(
-                  _leaf(_imagePath!),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.w600,
-                    fontSize: 13,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  '${_partitions.length} 个分区',
-                  style: const TextStyle(
-                    fontSize: 11,
-                    color: Color(0xffa3b6cf),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 20),
-          Expanded(
-            child: ListView(
-              children: _partitions
-                  .map(
-                    (p) => Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Material(
-                        color: p['index'] == _partition
-                            ? const Color(0xff2c4b72)
-                            : Colors.transparent,
-                        borderRadius: BorderRadius.circular(8),
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(8),
-                          onTap: _busy || p['kind'] == 'Unknown'
-                              ? null
-                              : () => _switchPartition(p['index'] as int),
-                          child: Padding(
-                            padding: const EdgeInsets.all(12),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  p['kind'] == 'BitLocker'
-                                      ? Icons.lock_outline
-                                      : Icons.folder_outlined,
-                                  size: 18,
-                                  color: const Color(0xffb5cfff),
-                                ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        '分区 ${p['index']}',
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 13,
-                                        ),
-                                      ),
-                                      Text(
-                                        '${p['kind']} · ${formatBytes(p['length'] as int)}',
-                                        style: const TextStyle(
-                                          color: Color(0xffa3b6cf),
-                                          fontSize: 10,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  )
-                  .toList(),
-            ),
-          ),
-          if (_unlocked && _currentPartition?['kind'] == 'BitLocker')
-            TextButton.icon(
-              onPressed: _busy ? null : _lock,
-              icon: const Icon(Icons.lock_outline, size: 16),
-              label: const Text('锁定分区'),
-              style: TextButton.styleFrom(
-                foregroundColor: const Color(0xffc6d6eb),
-              ),
-            ),
-          TextButton.icon(
-            onPressed: _busy ? null : _close,
-            icon: const Icon(Icons.eject_outlined, size: 16),
-            label: const Text('关闭镜像'),
-            style: TextButton.styleFrom(
-              foregroundColor: const Color(0xffc6d6eb),
-            ),
-          ),
-        ],
-        if (_image == null) const Spacer(),
-        const Divider(color: Color(0xff30425a)),
-        const SizedBox(height: 12),
-        const Row(
-          children: [
-            Icon(
-              Icons.verified_user_outlined,
-              color: Color(0xff8da6c5),
-              size: 16,
-            ),
-            SizedBox(width: 8),
-            Text(
-              '只读访问 · 原文件不变',
-              style: TextStyle(color: Color(0xff8da6c5), fontSize: 11),
-            ),
-          ],
-        ),
-      ],
-    ),
+  Widget build(BuildContext context) => PopScope(
+    canPop:
+        !widget.active ||
+        _drawerOpen ||
+        (!_busy && _preview == null && _path == '/'),
+    onPopInvokedWithResult: (didPop, result) {
+      if (!didPop && widget.active) _goBack();
+    },
+    child: _browser(),
   );
+
   Widget _welcome() => Center(
     child: SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
+      padding: EdgeInsets.all(_compact ? 12 : 24),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 90,
-            height: 90,
+            width: _compact ? 48 : 90,
+            height: _compact ? 48 : 90,
             decoration: BoxDecoration(
               color: const Color(0xffe5edff),
               borderRadius: BorderRadius.circular(24),
             ),
-            child: const Icon(
+            child: Icon(
               Icons.folder_open_rounded,
-              size: 44,
-              color: Color(0xff316ee8),
+              size: _compact ? 30 : 44,
+              color: const Color(0xff316ee8),
             ),
           ),
-          const SizedBox(height: 28),
-          const Text(
+          SizedBox(height: _compact ? 10 : 28),
+          Text(
             '打开你的虚拟磁盘',
             style: TextStyle(
-              fontSize: 28,
+              fontSize: _compact ? 22 : 28,
               fontWeight: FontWeight.w700,
-              color: Color(0xff172b46),
+              color: const Color(0xff172b46),
             ),
           ),
-          const SizedBox(height: 14),
-          const Text(
+          SizedBox(height: _compact ? 6 : 14),
+          Text(
             '选择本机或外置 SSD 上的 VHDX 文件，\n浏览文件，预览内容，按需导出。',
             textAlign: TextAlign.center,
-            style: TextStyle(color: Color(0xff64748b), height: 1.9),
+            style: const TextStyle(color: Color(0xff64748b), height: 1.9),
           ),
-          const SizedBox(height: 30),
+          SizedBox(height: _compact ? 12 : 30),
           FilledButton.icon(
             onPressed: _busy ? null : _chooseImage,
             icon: const Icon(Icons.folder_open),
             label: const Text('选择 VHDX 文件'),
           ),
-          const SizedBox(height: 22),
+          SizedBox(height: _compact ? 8 : 22),
           const Text(
             '支持普通卷和 BitLocker 加密卷',
             style: TextStyle(fontSize: 12, color: Color(0xff94a3b8)),
@@ -1419,236 +1213,569 @@ class _ReaderHomeState extends State<ReaderHome> {
     );
   }
 
-  Widget _fileList() {
-    final query = _filter.text.toLowerCase();
-    final entries =
-        _entries
-            .where((e) => (e['name'] as String).toLowerCase().contains(query))
-            .toList()
-          ..sort((a, b) {
-            final directories =
-                (b['directory'] == true ? 1 : 0) -
-                (a['directory'] == true ? 1 : 0);
-            return directories != 0
-                ? directories
-                : (a['name'] as String).toLowerCase().compareTo(
-                    (b['name'] as String).toLowerCase(),
-                  );
-          });
-    final parts = _path.split('/').where((p) => p.isNotEmpty).toList();
-    final content = Padding(
-      padding: const EdgeInsets.all(24),
-      child: Column(
+  void _dismissPreview() => setState(() {
+    _previewRevision++;
+    _preview?.dispose();
+    _preview = null;
+  });
+
+  bool get _windowsChrome => widget.platform == TargetPlatform.windows;
+  final _previewKey = GlobalKey();
+  bool get _compact => ScreenLayout(context).compact;
+
+  void _goBack() {
+    if (_drawerOpen) {
+      _shell.currentState?.closeDrawer();
+      return;
+    }
+    if (_preview?.media != null) {
+      if (_busy) widget.backend.cancel();
+      _dismissPreview();
+    } else if (_busy) {
+      widget.backend.cancel();
+      setState(() => _status = '正在取消…');
+    } else if (_preview != null) {
+      _dismissPreview();
+    } else if (_path != '/') {
+      final parts = _path.split('/').where((p) => p.isNotEmpty).toList();
+      unawaited(
+        _run(
+          '正在读取目录…',
+          () => _load(
+            parts.length <= 1
+                ? '/'
+                : '/${parts.take(parts.length - 1).join('/')}',
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> _refresh() async {
+    if (widget.active && _unlocked && !_busy) {
+      await _run('正在刷新…', () => _load(_path));
+    }
+  }
+
+  Widget _browser() => CallbackShortcuts(
+    bindings: {
+      const SingleActivator(LogicalKeyboardKey.f5): () {
+        if (_preview == null) unawaited(_refresh());
+      },
+    },
+    child: Focus(
+      focusNode: _desktopFocus,
+      autofocus: widget.active,
+      child: Stack(
+        fit: StackFit.expand,
         children: [
-          Row(
-            children: [
-              IconButton(
-                tooltip: '上一级',
-                onPressed: _busy || parts.isEmpty
-                    ? null
-                    : () => _run(
-                        '正在读取目录…',
-                        () => _load(
-                          parts.length == 1
-                              ? '/'
-                              : '/${parts.take(parts.length - 1).join('/')}',
-                        ),
-                      ),
-                icon: const Icon(Icons.arrow_back, size: 18),
-              ),
-              Expanded(
-                child: SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    children: [
-                      TextButton(
-                        onPressed: _busy
-                            ? null
-                            : () => _run('正在读取目录…', () => _load('/')),
-                        child: const Text('根目录'),
-                      ),
-                      for (var i = 0; i < parts.length; i++) ...[
-                        const Icon(
-                          Icons.chevron_right,
-                          size: 16,
-                          color: Color(0xff94a3b8),
-                        ),
-                        TextButton(
-                          onPressed: _busy
-                              ? null
-                              : () => _run(
-                                  '正在读取目录…',
-                                  () =>
-                                      _load('/${parts.take(i + 1).join('/')}'),
+          Offstage(
+            offstage: _preview != null && _preview?.media == null,
+            child: ExcludeFocus(
+              excluding: _preview != null,
+              child: ExcludeSemantics(
+                excluding: _preview != null,
+                child: IgnorePointer(
+                  ignoring: _preview != null,
+                  child: Scaffold(
+                    key: _shell,
+                    drawer: _diskDrawer(),
+                    onDrawerChanged: (open) =>
+                        setState(() => _drawerOpen = open),
+                    body: SafeArea(
+                      child: Column(
+                        children: [
+                          _toolbar(),
+                          if (_busy)
+                            const LinearProgressIndicator(minHeight: 2)
+                          else
+                            const Divider(height: 2, color: Color(0xffe9ecf1)),
+                          if (_error != null)
+                            MaterialBanner(
+                              content: Text(
+                                _error!,
+                                style: const TextStyle(fontSize: 13),
+                              ),
+                              backgroundColor: const Color(0xfffff1f2),
+                              actions: [
+                                TextButton(
+                                  onPressed: () =>
+                                      setState(() => _error = null),
+                                  child: const Text('关闭'),
                                 ),
-                          child: Text(parts[i]),
-                        ),
-                      ],
-                    ],
-                  ),
-                ),
-              ),
-              IconButton(
-                tooltip: '刷新',
-                onPressed: _busy
-                    ? null
-                    : () => _run('正在刷新…', () => _load(_path)),
-                icon: const Icon(Icons.refresh, size: 20),
-              ),
-            ],
-          ),
-          const SizedBox(height: 14),
-          TextField(
-            controller: _filter,
-            enabled: !_busy,
-            onChanged: (_) => setState(() {}),
-            decoration: const InputDecoration(
-              hintText: '筛选已加载文件',
-              prefixIcon: Icon(Icons.search, size: 20),
-              isDense: true,
-            ),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Checkbox(
-                value: _showSystem,
-                visualDensity: VisualDensity.compact,
-                onChanged: _busy
-                    ? null
-                    : (value) {
-                        setState(() => _showSystem = value!);
-                        unawaited(_run('正在读取目录…', () => _load(_path)));
-                      },
-              ),
-              const Text(
-                '显示隐藏和系统文件',
-                style: TextStyle(fontSize: 11, color: Color(0xff64748b)),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            decoration: const BoxDecoration(
-              color: Color(0xffeaf0f8),
-              borderRadius: BorderRadius.vertical(top: Radius.circular(10)),
-            ),
-            child: const Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    '名称',
-                    style: TextStyle(fontSize: 12, color: Color(0xff64748b)),
-                  ),
-                ),
-                SizedBox(
-                  width: 80,
-                  child: Text(
-                    '大小',
-                    textAlign: TextAlign.right,
-                    style: TextStyle(fontSize: 12, color: Color(0xff64748b)),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: Container(
-              decoration: BoxDecoration(
-                color: Colors.white,
-                border: Border.all(color: const Color(0xffe8edf4)),
-                borderRadius: const BorderRadius.vertical(
-                  bottom: Radius.circular(10),
-                ),
-              ),
-              child: entries.isEmpty
-                  ? const Center(
-                      child: Text(
-                        '没有可显示的文件',
-                        style: TextStyle(color: Color(0xff94a3b8)),
-                      ),
-                    )
-                  : ListView.builder(
-                      itemCount: entries.length,
-                      itemBuilder: (context, index) {
-                        final entry = entries[index];
-                        final name = entry['name'] as String;
-                        final directory = entry['directory'] as bool;
-                        return Material(
-                          color: _selected?['name'] == name
-                              ? const Color(0xffedf3ff)
-                              : Colors.white,
-                          child: InkWell(
-                            onTap: _busy ? null : () => _select(entry),
-                            child: Container(
+                              ],
+                            ),
+                          Expanded(
+                            child: _image == null
+                                ? _welcome()
+                                : !_unlocked
+                                ? _unlockView()
+                                : _fileList(),
+                          ),
+                          if (!_compact)
+                            Container(
+                              height: 30,
                               padding: const EdgeInsets.symmetric(
-                                horizontal: 16,
-                                vertical: 15,
+                                horizontal: 18,
                               ),
                               decoration: const BoxDecoration(
                                 border: Border(
-                                  bottom: BorderSide(color: Color(0xfff1f4f8)),
+                                  top: BorderSide(color: Color(0xffe9ecf1)),
                                 ),
                               ),
                               child: Row(
                                 children: [
-                                  Icon(
-                                    fileIcon(name, directory),
-                                    size: 22,
-                                    color: directory
-                                        ? const Color(0xffdca72c)
-                                        : const Color(0xff6083b9),
-                                  ),
-                                  const SizedBox(width: 12),
                                   Expanded(
                                     child: Text(
-                                      name,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(fontSize: 13),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 10),
-                                  SizedBox(
-                                    width: 80,
-                                    child: Text(
-                                      directory
-                                          ? '文件夹'
-                                          : formatBytes(entry['size'] as int),
-                                      textAlign: TextAlign.right,
+                                      _busy
+                                          ? _status
+                                          : _unlocked
+                                          ? '${_entries.length} 个项目'
+                                          : '就绪',
                                       style: const TextStyle(
                                         fontSize: 11,
-                                        color: Color(0xff64748b),
+                                        color: Color(0xff8590a0),
                                       ),
+                                    ),
+                                  ),
+                                  if (_busy)
+                                    TextButton(
+                                      onPressed: () {
+                                        widget.backend.cancel();
+                                        setState(() => _status = '正在取消…');
+                                      },
+                                      child: const Text('取消'),
+                                    ),
+                                  const Icon(
+                                    Icons.shield_outlined,
+                                    size: 12,
+                                    color: Color(0xff98a1ad),
+                                  ),
+                                  const SizedBox(width: 5),
+                                  const Text(
+                                    '只读',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: Color(0xff98a1ad),
                                     ),
                                   ),
                                 ],
                               ),
                             ),
-                          ),
-                        );
-                      },
+                        ],
+                      ),
                     ),
+                  ),
+                ),
+              ),
             ),
           ),
-          if (_nextIndex != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 12),
-              child: OutlinedButton(
-                onPressed: _busy
+          if (_preview != null)
+            Positioned.fill(
+              child: PreviewScreen(
+                key: _previewKey,
+                data: _preview!,
+                active: widget.active,
+                onExport: _busy ? null : _export,
+                onBack: _goBack,
+                error: _error,
+                busy: _busy,
+                onPrevious: _videoNeighbour(-1) == null
                     ? null
-                    : () => _run('正在加载更多…', () => _load(_path, append: true)),
-                child: const Text('加载更多'),
+                    : () => unawaited(
+                        _select(_videoNeighbour(-1)!, replaceVideo: true),
+                      ),
+                onNext: _videoNeighbour(1) == null
+                    ? null
+                    : () => unawaited(
+                        _select(_videoNeighbour(1)!, replaceVideo: true),
+                      ),
               ),
             ),
         ],
       ),
+    ),
+  );
+
+  Widget _diskDrawer() => DiskDrawer(
+    images: widget.images,
+    activeImageId: widget.activeImageId,
+    onSelect: (id) {
+      _shell.currentState?.closeDrawer();
+      widget.onSelectImage?.call(id);
+    },
+    onAdd: widget.workspaceBusy ? null : () => _drawerAction('open-image'),
+    onSettings: () {
+      _shell.currentState?.closeDrawer();
+      widget.onSettings?.call();
+    },
+    actions: [
+      if (_image != null) ...[
+        if (_partitions.length > 1)
+          _drawerItem(
+            'partition',
+            '切换分区',
+            Icons.storage_outlined,
+            enabled: !_busy,
+          ),
+        _drawerItem('image-info', '镜像信息', Icons.info_outline),
+        if (_unlocked)
+          _drawerItem('refresh', '刷新', Icons.refresh, enabled: !_busy),
+        if (_unlocked && _currentPartition?['kind'] == 'BitLocker')
+          _drawerItem('lock', '锁定分区', Icons.lock_outline, enabled: !_busy),
+      ],
+      if (_imagePath != null || widget.initialImage != null)
+        _drawerItem(
+          'close-image',
+          '关闭镜像',
+          Icons.close,
+          enabled: !_busy && !widget.workspaceBusy,
+        ),
+    ],
+  );
+
+  Widget _drawerItem(
+    String action,
+    String label,
+    IconData icon, {
+    bool enabled = true,
+  }) => ListTile(
+    key: ValueKey(action),
+    leading: Icon(icon),
+    title: Text(label),
+    enabled: enabled,
+    onTap: () => _drawerAction(action),
+  );
+
+  void _drawerAction(String action) {
+    _shell.currentState?.closeDrawer();
+    unawaited(_menuAction(action));
+  }
+
+  Widget _title(String? imagePath) => _compact
+      ? Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Row(
+            children: [
+              Expanded(
+                child: InkWell(
+                  onTap: imagePath == null
+                      ? null
+                      : () => showDialog<void>(
+                          context: context,
+                          builder: (_) => AlertDialog(
+                            title: const Text('当前位置'),
+                            content: SelectableText(
+                              '${_leaf(imagePath)}\n分区 ${_partition ?? '—'}\n$_path',
+                            ),
+                            actions: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(context),
+                                child: const Text('关闭'),
+                              ),
+                            ],
+                          ),
+                        ),
+                  child: Text(
+                    imagePath == null
+                        ? 'VHDX Reader'
+                        : '${_path == '/' ? '根目录' : _leaf(_path)} · ${_leaf(imagePath)}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              if (_unlocked && !_busy)
+                Padding(
+                  padding: const EdgeInsets.only(left: 8),
+                  child: Text(
+                    '${_entries.length} 个项目',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: Color(0xff8590a0),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        )
+      : Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                imagePath == null ? 'VHDX Reader' : _leaf(imagePath),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              if (imagePath != null)
+                Text(
+                  '分区 ${_partition ?? '—'} · ${_path == '/' ? '根目录' : _path}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: Color(0xff88919e),
+                  ),
+                ),
+            ],
+          ),
+        );
+
+  Widget _toolbar() {
+    final title = _title(_imagePath ?? widget.initialImage);
+    return SizedBox(
+      height: ScreenLayout(context).toolbarHeight,
+      child: Row(
+        children: [
+          IconButton(
+            key: const Key('disk-navigation'),
+            tooltip: '磁盘与设置',
+            onPressed: () => _shell.currentState?.openDrawer(),
+            icon: const Icon(Icons.menu),
+          ),
+          if (_image != null && (_path != '/' || _preview != null))
+            IconButton(
+              key: const Key('navigate-back'),
+              tooltip: _preview != null ? '返回文件列表' : '上一级',
+              onPressed: _busy ? null : _goBack,
+              icon: const Icon(Icons.arrow_back, size: 20),
+            ),
+          Expanded(
+            child: _windowsChrome
+                ? Row(
+                    children: [
+                      Flexible(
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 400),
+                          child: title,
+                        ),
+                      ),
+                      const Expanded(child: WindowDragArea()),
+                    ],
+                  )
+                : title,
+          ),
+          if (_compact && _busy)
+            IconButton(
+              tooltip: '取消读取',
+              onPressed: () {
+                widget.backend.cancel();
+                setState(() => _status = '正在取消…');
+              },
+              icon: const Icon(Icons.close),
+            ),
+          IconButton(
+            key: const Key('display-menu'),
+            tooltip: '展示',
+            onPressed: _unlocked ? _showDisplayMenu : null,
+            icon: const Icon(Icons.tune, size: 21),
+          ),
+          if (_windowsChrome) const WindowButtons(),
+        ],
+      ),
     );
-    return LayoutBuilder(
-      builder: (context, constraints) => constraints.maxHeight < 380
-          ? SingleChildScrollView(child: SizedBox(height: 380, child: content))
-          : content,
+  }
+
+  Future<void> _showDisplayMenu() async {
+    final button = context.findRenderObject();
+    if (button == null) return;
+    final media = MediaQuery.of(context);
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        media.size.width - media.padding.right - 304,
+        media.padding.top + ScreenLayout(context).toolbarHeight,
+        media.padding.right + 8,
+        0,
+      ),
+      color: Colors.white,
+      surfaceTintColor: Colors.transparent,
+      constraints: BoxConstraints(
+        minWidth: 264,
+        maxWidth: 304,
+        maxHeight: (media.size.height - media.padding.vertical - 64).clamp(
+          96.0,
+          500.0,
+        ),
+      ),
+      items: [
+        PopupMenuItem<String>(
+          enabled: false,
+          padding: const EdgeInsets.all(8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  _displayChoice('view-grid', '网格', _grid),
+                  _displayChoice('view-list', '列表', !_grid),
+                ],
+              ),
+              const Divider(height: 12),
+              Row(
+                children: [
+                  _displayChoice('sort-name', '名称', _sort == FileSort.name),
+                  _displayChoice('sort-size', '大小', _sort == FileSort.size),
+                ],
+              ),
+              Row(
+                children: [
+                  _displayChoice(
+                    'sort-modified',
+                    '修改日期',
+                    _sort == FileSort.modified,
+                  ),
+                  _displayChoice('sort-type', '类型', _sort == FileSort.type),
+                ],
+              ),
+              const Divider(height: 12),
+              Row(
+                children: [
+                  _displayChoice('order-ascending', '升序', !_descending),
+                  _displayChoice('order-descending', '降序', _descending),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+    if (result != null && mounted) await _menuAction(result);
+  }
+
+  Widget _displayChoice(String value, String label, bool selected) => Expanded(
+    child: Builder(
+      builder: (menuContext) => Padding(
+        padding: const EdgeInsets.all(2),
+        child: Semantics(
+          selected: selected,
+          child: TextButton(
+            key: ValueKey(value),
+            style: TextButton.styleFrom(
+              minimumSize: const Size(0, 44),
+              backgroundColor: selected
+                  ? const Color(0xffedf2ff)
+                  : Colors.transparent,
+              foregroundColor: selected
+                  ? const Color(0xff2563eb)
+                  : const Color(0xff475569),
+            ),
+            onPressed: () => Navigator.of(menuContext).pop(value),
+            child: Text(selected ? '✓ $label' : label),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  Future<void> _menuAction(String action) async {
+    switch (action) {
+      case 'view-list':
+        setState(() => _grid = false);
+      case 'view-grid':
+        setState(() => _grid = true);
+      case 'sort-name':
+        setState(() => _sort = FileSort.name);
+      case 'sort-modified':
+        setState(() => _sort = FileSort.modified);
+      case 'sort-size':
+        setState(() => _sort = FileSort.size);
+      case 'sort-type':
+        setState(() => _sort = FileSort.type);
+      case 'order-ascending':
+        setState(() => _descending = false);
+      case 'order-descending':
+        setState(() => _descending = true);
+      case 'open-image':
+        await widget.onOpenImages();
+      case 'show-system':
+        widget.onShowSystem?.call(!_showSystem);
+      case 'credential-manager':
+        await widget.onCredentials?.call();
+      case 'refresh':
+        await _refresh();
+      case 'lock':
+        await _lock();
+      case 'close-image':
+        await _close();
+      case 'partition':
+        final index = await showDialog<int>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('切换分区'),
+            content: SizedBox(
+              width: 360,
+              child: ListView(
+                shrinkWrap: true,
+                children: [
+                  for (final p in _partitions)
+                    ListTile(
+                      enabled: p['kind'] != 'Unknown',
+                      leading: Icon(
+                        p['index'] == _partition
+                            ? Icons.check
+                            : Icons.storage_outlined,
+                      ),
+                      title: Text('分区 ${p['index']}'),
+                      subtitle: Text(
+                        '${p['kind']} · ${formatBytes(p['length'] as int)}',
+                      ),
+                      onTap: () => Navigator.pop(context, p['index'] as int),
+                    ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('取消'),
+              ),
+            ],
+          ),
+        );
+        if (mounted && index != null && index != _partition) {
+          await _switchPartition(index);
+        }
+      case 'image-info':
+        await showDialog<void>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('镜像信息'),
+            content: Text(
+              '${_leaf(_imagePath!)}\n${formatBytes(_image!['virtual_size'] as int)} · ${_image!['disk_type'] == 'dynamic' ? '动态磁盘' : '固定磁盘'}\n${_partitions.length} 个分区 · 只读',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('完成'),
+              ),
+            ],
+          ),
+        );
+    }
+  }
+
+  Widget _fileList() {
+    return FileContents(
+      entries: _entries,
+      grid: _grid,
+      sort: _sort,
+      descending: _descending,
+      selected: _selected?['name'] as String?,
+      storageKey: '$_imagePath-$_partition-$_path',
+      onRefresh: _refresh,
+      onOpen: _busy ? null : _select,
     );
   }
 }

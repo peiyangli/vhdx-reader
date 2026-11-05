@@ -11,6 +11,8 @@
 *Recovery*Key*.TXT
 password.txt
 .DS_Store
+__pycache__/
+*.pyc
 /.tools/
 **/.dart_tool/
 **/build/

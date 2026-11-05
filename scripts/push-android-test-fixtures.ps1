@@ -1,8 +1,7 @@
-param([Parameter(Mandatory=$true)][string]$Device, [string]$AndroidSdk = "$env:LOCALAPPDATA\Android\Sdk")
+param([Parameter(Mandatory=$true)][string]$Device, [string]$Package = 'org.vhdxreader.vhdx_reader.uitest', [string]$AndroidSdk = "$env:LOCALAPPDATA\Android\Sdk")
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $adb = "$AndroidSdk\platform-tools\adb.exe"
-$package = 'org.vhdxreader.vhdx_reader'
 & $adb -s $Device shell run-as $package mkdir -p files/fixtures
 if ($LASTEXITCODE -ne 0) { throw 'Install the debug APK first; run-as must be available' }
 $items = @(

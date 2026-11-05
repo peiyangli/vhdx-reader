@@ -28,7 +28,7 @@ class _Bindings {
     final version = library.lookupFunction<Uint32 Function(), int Function()>(
       'vhdx_api_version',
     )();
-    if (version != 6) throw ReaderFailure('version', '读取组件版本不匹配，请重新解压完整程序。');
+    if (version != 7) throw ReaderFailure('version', '读取组件版本不匹配，请重新解压完整程序。');
     request = library
         .lookupFunction<
           Pointer<Utf8> Function(Uint64, Pointer<Uint8>, UintPtr),

@@ -31,6 +31,8 @@ fn desktop_password_unlock_filter_preview_lock_and_switch() {
     );
     let entries = listing["data"]["entries"].as_array().unwrap();
     assert!(entries.iter().any(|e| e["name"] == "hello.txt"));
+    let hello = entries.iter().find(|e| e["name"] == "hello.txt").unwrap();
+    assert!(hello["modified_unix_ms"].as_i64().unwrap() > 0);
     assert!(entries
         .iter()
         .all(|e| !e["name"].as_str().unwrap().starts_with('$')));

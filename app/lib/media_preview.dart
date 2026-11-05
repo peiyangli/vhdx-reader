@@ -1,10 +1,14 @@
 import 'dart:async';
 import 'dart:io';
 import 'platform_storage.dart';
+import 'playback_controls.dart';
+import 'video_dismiss_view.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+// Pinned media_kit_video 2.0.1: drain its Android resize work before teardown.
+// ignore: implementation_imports
+import 'package:media_kit_video/src/video_controller/android_video_controller/android_video_controller.dart';
 import 'backend.dart';
 
 class MediaPreviewSource extends ChangeNotifier {
@@ -154,6 +158,8 @@ class MediaPreviewSource extends ChangeNotifier {
     unawaited(
       _command(() async {
         if (!_visible) {
+          _resumeAfterPull = null;
+          await _restoreBoost(pause: true);
           await player.pause();
         } else if (autoPlay) {
           await player.play();
@@ -176,6 +182,68 @@ class MediaPreviewSource extends ChangeNotifier {
   Future<Map<String, dynamic>> statistics() =>
       backend.request({'op': 'media_status', 'file': file});
 
+  bool? _resumeAfterPull;
+
+  Future<void> beginPull() => _command(() async {
+    if (!_visible || _resumeAfterPull != null) return;
+    await _restoreBoost();
+    _resumeAfterPull = player.state.playing;
+    await player.pause();
+  });
+
+  Future<void> cancelPull() => _command(() async {
+    final resume = _resumeAfterPull;
+    _resumeAfterPull = null;
+    if (resume == true && _visible) await player.play();
+  });
+
+  double? _restoreRate;
+  bool _restorePlaying = false;
+
+  Future<void> beginBoost() => _command(() async {
+    if (!_visible || _restoreRate != null || error != null) return;
+    _restoreRate = player.state.rate;
+    _restorePlaying = player.state.playing;
+    await player.setRate(2);
+    if (!_restorePlaying) await player.play();
+  });
+
+  Future<void> _restoreBoost({bool pause = false}) async {
+    final rate = _restoreRate;
+    if (rate == null) return;
+    _restoreRate = null;
+    try {
+      await player.setRate(rate);
+    } finally {
+      if (pause || !_restorePlaying) await player.pause();
+    }
+  }
+
+  Future<void> endBoost({bool pause = false}) =>
+      _command(() => _restoreBoost(pause: pause));
+  Future<void> suspend() => _command(() async {
+    _visible = false;
+    _resumeAfterPull = null;
+    await _restoreBoost(pause: true);
+    await player.pause();
+  });
+
+  Future<void> _disposePlayer() async {
+    try {
+      final output = await controller.platform.future;
+      if (output is AndroidVideoController) {
+        // 2.0.1 disposes rect/wid before waiting for asynchronous resize callbacks.
+        // Stop new work and drain queued callbacks while their notifiers and
+        // player are still alive. No delays or swallowed use-after-dispose errors.
+        await output.videoParamsSubscription?.cancel();
+        output.wid.removeListener(output.widListener);
+        await output.lock.synchronized(() async {});
+      }
+    } finally {
+      await player.dispose();
+    }
+  }
+
   @override
   void dispose() {
     if (_disposed) return;
@@ -193,7 +261,7 @@ class MediaPreviewSource extends ChangeNotifier {
       _commands
           .then((_) async {
             try {
-              await player.dispose();
+              await _disposePlayer();
             } finally {
               if (_ownsPlaybackSession) await PlatformStorage.endPlayback();
             }
@@ -205,202 +273,104 @@ class MediaPreviewSource extends ChangeNotifier {
 }
 
 class MediaPreview extends StatefulWidget {
-  const MediaPreview({super.key, required this.source, required this.active});
+  const MediaPreview({
+    super.key,
+    required this.source,
+    required this.active,
+    required this.onExit,
+    this.onPrevious,
+    this.onNext,
+    this.switching = false,
+    this.message,
+  });
+  final VoidCallback? onPrevious;
+  final VoidCallback? onNext;
+  final bool switching;
+  final String? message;
   final MediaPreviewSource source;
   final bool active;
+  final VoidCallback onExit;
   @override
   State<MediaPreview> createState() => _MediaPreviewState();
 }
 
-class _MediaPreviewState extends State<MediaPreview> {
+class _MediaPreviewState extends State<MediaPreview>
+    with WidgetsBindingObserver {
+  bool _foreground = true;
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final active = state == AppLifecycleState.resumed;
+    if (!active) unawaited(widget.source.suspend());
+    if (active) widget.source.setVisible(widget.active);
+    if (mounted) setState(() => _foreground = active);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(widget.source.endBoost(pause: true));
+    super.dispose();
+  }
+
   @override
   void initState() {
     super.initState();
-    widget.source.setVisible(widget.active);
+    WidgetsBinding.instance.addObserver(this);
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
+    widget.source.setVisible(widget.active && _foreground);
   }
 
   @override
   void didUpdateWidget(covariant MediaPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.active != oldWidget.active) {
-      widget.source.setVisible(widget.active);
+      widget.source.setVisible(widget.active && _foreground);
     }
   }
 
   @override
-  Widget build(BuildContext context) => Video(
-    controller: widget.source.controller,
-    controls: (state) => _PlaybackControls(source: widget.source),
-    pauseUponEnteringBackgroundMode: true,
-    resumeUponEnteringForegroundMode: false,
-  );
-}
-
-String mediaTime(Duration time) {
-  final seconds = time.inSeconds.clamp(0, 999999);
-  final minutes = seconds ~/ 60;
-  return minutes >= 60
-      ? '${minutes ~/ 60}:${(minutes % 60).toString().padLeft(2, '0')}:${(seconds % 60).toString().padLeft(2, '0')}'
-      : '$minutes:${(seconds % 60).toString().padLeft(2, '0')}';
-}
-
-class _PlaybackControls extends StatefulWidget {
-  const _PlaybackControls({required this.source});
-  final MediaPreviewSource source;
-  @override
-  State<_PlaybackControls> createState() => _PlaybackControlsState();
-}
-
-class _PlaybackControlsState extends State<_PlaybackControls> {
-  double? _drag;
-  @override
-  Widget build(BuildContext context) => Focus(
-    autofocus: true,
-    onKeyEvent: (node, event) {
-      if (event is! KeyDownEvent) return KeyEventResult.ignored;
-      if (event.logicalKey == LogicalKeyboardKey.space) {
-        unawaited(widget.source.toggle());
-        return KeyEventResult.handled;
-      }
-      if (event.logicalKey == LogicalKeyboardKey.escape &&
-          isFullscreen(context)) {
-        unawaited(exitFullscreen(context));
-        return KeyEventResult.handled;
-      }
-      return KeyEventResult.ignored;
-    },
-    child: AnimatedBuilder(
+  Widget build(BuildContext context) => VideoDismissView(
+    enabled: widget.active && _foreground && !widget.switching,
+    onStart: () => unawaited(widget.source.beginPull()),
+    onCancel: () => unawaited(widget.source.cancelPull()),
+    onDismiss: widget.onExit,
+    child: Video(
+      controller: widget.source.controller,
+      controls: NoVideoControls,
+      fill: Colors.transparent,
+      pauseUponEnteringBackgroundMode: true,
+      resumeUponEnteringForegroundMode: false,
+    ),
+    controls: (update, end, cancel, pulling) => AnimatedBuilder(
       animation: widget.source,
-      builder: (context, child) {
-        final source = widget.source;
-        final duration = source.duration.inMilliseconds.toDouble();
-        final position = (_drag ?? source.position.inMilliseconds.toDouble())
-            .clamp(0.0, duration > 0 ? duration : 1.0);
-        return Stack(
-          children: [
-            if (source.error != null)
-              Center(
-                child: Container(
-                  padding: const EdgeInsets.all(18),
-                  color: Colors.black87,
-                  child: Text(
-                    source.error!,
-                    style: const TextStyle(color: Colors.white),
-                  ),
-                ),
+      builder: (context, child) => PlaybackControls(
+        position: widget.source.position,
+        duration: widget.source.duration,
+        playing: widget.source.playing,
+        muted: widget.source.volume == 0,
+        buffering: widget.source.buffering || widget.switching,
+        error: widget.message ?? widget.source.error,
+        enabled: widget.active && _foreground && !widget.switching,
+        onPullUpdate: update,
+        onPullEnd: end,
+        onPullCancel: cancel,
+        pulling: pulling,
+        onPrevious: widget.onPrevious,
+        onNext: widget.onNext,
+        onHoldStart: widget.source.error == null
+            ? () => unawaited(widget.source.beginBoost())
+            : null,
+        onHoldEnd: () => unawaited(widget.source.endBoost()),
+        onPlay: () => unawaited(widget.source.toggle()),
+        onMute: widget.source.audioOutputAvailable
+            ? () => unawaited(
+                widget.source.setVolume(widget.source.volume == 0 ? 100 : 0),
               )
-            else if (source.buffering)
-              const Center(
-                child: CircularProgressIndicator(color: Colors.white),
-              ),
-            Align(
-              alignment: Alignment.bottomCenter,
-              child: Container(
-                color: const Color(0xcc101820),
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                child: SingleChildScrollView(
-                  reverse: true,
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (!source.audioOutputAvailable)
-                        const Text(
-                          '模拟器不输出声音，请在真机验证音频。',
-                          style: TextStyle(color: Colors.white70, fontSize: 12),
-                        ),
-                      Slider(
-                        key: const Key('media-seek'),
-                        value: position,
-                        max: duration > 0 ? duration : 1,
-                        onChangeStart: duration > 0
-                            ? (value) => setState(() => _drag = value)
-                            : null,
-                        onChanged: duration > 0
-                            ? (value) => setState(() => _drag = value)
-                            : null,
-                        onChangeEnd: duration > 0
-                            ? (value) {
-                                setState(() => _drag = null);
-                                unawaited(
-                                  source.seek(
-                                    Duration(milliseconds: value.round()),
-                                  ),
-                                );
-                              }
-                            : null,
-                      ),
-                      Row(
-                        children: [
-                          IconButton(
-                            key: const Key('media-play'),
-                            tooltip: source.playing ? '暂停' : '播放',
-                            onPressed: source.toggle,
-                            color: Colors.white,
-                            icon: Icon(
-                              source.playing ? Icons.pause : Icons.play_arrow,
-                            ),
-                          ),
-                          Text(
-                            '${mediaTime(Duration(milliseconds: position.round()))} / ${mediaTime(source.duration)}',
-                            key: const Key('media-time'),
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 12,
-                            ),
-                          ),
-                          const Spacer(),
-                          IconButton(
-                            tooltip: !source.audioOutputAvailable
-                                ? '模拟器无音频输出'
-                                : source.volume == 0
-                                ? '取消静音'
-                                : '静音',
-                            onPressed: source.audioOutputAvailable
-                                ? () => source.setVolume(
-                                    source.volume == 0 ? 100 : 0,
-                                  )
-                                : null,
-                            color: Colors.white,
-                            icon: Icon(
-                              source.volume == 0
-                                  ? Icons.volume_off
-                                  : Icons.volume_up,
-                            ),
-                          ),
-                          SizedBox(
-                            width: MediaQuery.sizeOf(context).width < 480
-                                ? 64
-                                : 100,
-                            child: Slider(
-                              key: const Key('media-volume'),
-                              value: source.volume.clamp(0, 100),
-                              max: 100,
-                              onChanged: source.audioOutputAvailable
-                                  ? source.setVolume
-                                  : null,
-                            ),
-                          ),
-                          IconButton(
-                            key: const Key('media-fullscreen'),
-                            tooltip: isFullscreen(context) ? '退出全屏' : '全屏',
-                            onPressed: () => toggleFullscreen(context),
-                            color: Colors.white,
-                            icon: Icon(
-                              isFullscreen(context)
-                                  ? Icons.fullscreen_exit
-                                  : Icons.fullscreen,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ],
-        );
-      },
+            : null,
+        onSeek: (value) => unawaited(widget.source.seek(value)),
+        onExit: widget.onExit,
+      ),
     ),
   );
 }

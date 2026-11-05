@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'ui_actions.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vhdx_reader/backend.dart';
@@ -83,11 +84,12 @@ void main() {
       expect(find.text('notes.txt'), findsOneWidget);
       expect(find.byKey(const Key('unlock-secret')), findsNothing);
       expect(backend.ops.where((op) => op == 'unlock_saved').length, 1);
-      await tester.tap(find.text('锁定分区'));
+      await browserAction(tester, 'lock', legacy: find.text('锁定分区'));
       await tester.pumpAndSettle();
       expect(find.text('解锁 BitLocker 分区'), findsOneWidget);
       expect(backend.ops.where((op) => op == 'unlock_saved').length, 1);
-      await tester.tap(find.byKey(const Key('credential-manager')));
+      await browserAction(tester, 'credential-manager');
+
       await tester.pumpAndSettle();
       await tester.tap(find.byTooltip('删除记录'));
       await tester.pumpAndSettle();
@@ -170,7 +172,11 @@ void main() {
       addTearDown(tester.view.resetDevicePixelRatio);
       final backend = FakeBackend()..reject = false;
       await tester.pumpWidget(
-        ReaderApp(backend: backend, initialImage: 'phone.vhdx'),
+        ReaderApp(
+          backend: backend,
+          initialImage: 'phone.vhdx',
+          platform: TargetPlatform.iOS,
+        ),
       );
       await tester.pumpAndSettle();
       await tester.enterText(find.byKey(const Key('unlock-secret')), 'fake');
@@ -180,7 +186,7 @@ void main() {
       await tester.tap(find.text('notes.txt'));
       await tester.pumpAndSettle();
       expect(find.text('hello'), findsOneWidget);
-      Navigator.of(tester.element(find.text('hello'))).pop();
+      await closePreview(tester);
       await tester.pumpAndSettle();
       // A phone can remain landscape after leaving fullscreen video.
       tester.view.physicalSize = const Size(800, 360);
@@ -191,20 +197,20 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('hello'), findsOneWidget);
       expect(tester.takeException(), isNull);
-      Navigator.of(tester.element(find.text('hello'))).pop();
+      await closePreview(tester);
       tester.view.physicalSize = const Size(360, 800);
       await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('镜像和分区'));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('锁定分区'));
+      await browserAction(tester, 'lock', legacy: find.text('锁定分区'));
       await tester.pumpAndSettle();
       expect(find.text('解锁 BitLocker 分区'), findsOneWidget);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
       tester.view.physicalSize = const Size(800, 360);
-      await tester.pumpWidget(ReaderApp(backend: FakeBackend()));
+      await tester.pumpWidget(
+        ReaderApp(backend: FakeBackend(), platform: TargetPlatform.iOS),
+      );
       await tester.pumpAndSettle();
-      expect(find.byTooltip('镜像和分区'), findsOneWidget);
+      expect(find.byKey(const Key('disk-navigation')), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );
@@ -246,7 +252,8 @@ void main() {
       await tester.tap(find.text('notes.txt'));
       await tester.pumpAndSettle();
       expect(find.text('hello'), findsOneWidget);
-      await tester.tap(find.text('锁定分区'));
+      await closePreview(tester);
+      await browserAction(tester, 'lock', legacy: find.text('锁定分区'));
       await tester.pumpAndSettle();
       expect(find.text('hello'), findsNothing);
       expect(find.text('解锁 BitLocker 分区'), findsOneWidget);
@@ -259,12 +266,14 @@ void main() {
     tester.view.devicePixelRatio = 1;
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
-    await tester.pumpWidget(ReaderApp(backend: FakeBackend()));
+    await tester.pumpWidget(
+      ReaderApp(backend: FakeBackend(), platform: TargetPlatform.iOS),
+    );
     await tester.pumpAndSettle();
     expect(find.text('选择 VHDX 文件'), findsOneWidget);
   });
   testWidgets(
-    'multiple images preserve preview and unlock state; duplicate focuses; close is isolated',
+    'multiple images preserve directory and unlock state; duplicate focuses; close is isolated',
     (tester) async {
       tester.view.physicalSize = const Size(1400, 900);
       tester.view.devicePixelRatio = 1;
@@ -292,27 +301,44 @@ void main() {
       await tester.tap(find.text('notes.txt'));
       await tester.pumpAndSettle();
       expect(find.text('hello'), findsOneWidget);
-      await tester.tap(find.byTooltip('添加镜像（可多选）'));
+      await closePreview(tester);
+      await browserAction(
+        tester,
+        'open-image',
+        legacy: find.byTooltip('添加镜像（可多选）'),
+      );
       await tester.pumpAndSettle();
       expect(creations, 1);
       expect(find.text('解锁 BitLocker 分区'), findsOneWidget);
-      await tester.tap(find.byKey(const ValueKey('image-tab-0')));
+      await switchImage(tester, 0);
       await tester.pumpAndSettle();
-      expect(find.text('hello'), findsOneWidget);
+      expect(find.text('notes.txt'), findsOneWidget);
       expect(first.ops.where((op) => op == 'unlock').length, 1);
       picks = ['first.vhdx'];
-      await tester.tap(find.byTooltip('添加镜像（可多选）'));
+      await browserAction(
+        tester,
+        'open-image',
+        legacy: find.byTooltip('添加镜像（可多选）'),
+      );
       await tester.pumpAndSettle();
       expect(creations, 1);
       expect(first.ops.where((op) => op == 'open').length, 1);
-      await tester.tap(find.byKey(const ValueKey('image-tab-1')));
+      await switchImage(tester, 1);
       await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey('close-tab-1')));
+      await browserAction(
+        tester,
+        'close-image',
+        legacy: find.byKey(const ValueKey('close-tab-1')),
+      );
       await tester.pumpAndSettle();
       expect(second.disposed, isTrue);
       expect(first.disposed, isFalse);
-      expect(find.text('hello'), findsOneWidget);
-      await tester.tap(find.byKey(const ValueKey('close-tab-0')));
+      expect(find.text('notes.txt'), findsOneWidget);
+      await browserAction(
+        tester,
+        'close-image',
+        legacy: find.byKey(const ValueKey('close-tab-0')),
+      );
       await tester.pumpAndSettle();
       expect(find.text('选择 VHDX 文件'), findsOneWidget);
       expect(find.text('hello'), findsNothing);

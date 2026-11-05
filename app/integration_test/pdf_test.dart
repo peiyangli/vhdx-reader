@@ -1,3 +1,4 @@
+import '../test/ui_actions.dart';
 import 'test_configuration.dart';
 import 'dart:io';
 import 'dart:typed_data';
@@ -72,7 +73,7 @@ void main() {
   );
 
   testWidgets(
-    'PDF UI navigates, zooms, preserves page between image tabs, and reports corrupt files',
+    'PDF UI navigates, zooms, returns to list, and reports corrupt files',
     (tester) async {
       final backend = await NativeBackend.start();
       final capture = GlobalKey();
@@ -104,18 +105,6 @@ void main() {
       );
       await tester.tap(find.byTooltip('放大 PDF'));
       await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('添加镜像（可多选）'));
-      await tester.pumpAndSettle();
-      expect(find.text('can.txt'), findsOneWidget);
-      await tester.tap(find.byKey(const ValueKey('image-tab-0')));
-      await tester.pumpAndSettle();
-      expect(
-        tester
-            .widget<TextField>(find.byKey(const Key('pdf-page-input')))
-            .controller!
-            .text,
-        '2',
-      );
       final output = fixtureSetting('VHDX_PDF_SCREENSHOT');
       if (output != null) {
         await tester.tap(find.text('适合页面'));
@@ -130,7 +119,7 @@ void main() {
         await File(output).writeAsBytes(png!.buffer.asUint8List());
         image.dispose();
       }
-      await tester.tap(find.text('返回文件列表'));
+      await closePreview(tester);
       await tester.pumpAndSettle();
       expect(find.text('guide.pdf'), findsOneWidget);
       await tester.tap(find.text('broken.pdf'));
@@ -138,11 +127,14 @@ void main() {
         tester,
         () => find.textContaining('无法打开 PDF').evaluate().isNotEmpty,
       );
-      await tester.tap(find.text('返回文件列表'));
+      await closePreview(tester);
       await tester.pumpAndSettle();
       await tester.tap(find.text('small.pdf'));
       await waitFor(tester, () => find.text('/ 2').evaluate().isNotEmpty);
-      await tester.tap(find.byKey(const ValueKey('close-tab-0')));
+      await closePreview(tester);
+      await browserAction(tester, 'open-image');
+      await switchImage(tester, 0);
+      await browserAction(tester, 'close-image');
       await tester.pumpAndSettle();
       expect(find.text('can.txt'), findsOneWidget);
       await tester.pumpWidget(const SizedBox.shrink());

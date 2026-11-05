@@ -1,4 +1,5 @@
 import 'test_configuration.dart';
+import '../test/ui_actions.dart';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:ui' as ui;
@@ -102,20 +103,39 @@ void main() {
     await tester.tap(find.text('can.txt'));
     await tester.pumpAndSettle();
     expect(find.byType(SelectableText), findsOneWidget);
-    final modalPreview = find.byType(Dialog).evaluate().isNotEmpty;
-    if (modalPreview) {
-      Navigator.of(tester.element(find.byType(Dialog))).pop();
-      await tester.pumpAndSettle();
-    }
-    await tester.tap(find.byTooltip('添加镜像（可多选）'));
+    expect(find.byType(Dialog), findsNothing);
+    expect(find.byKey(const Key('disk-navigation')), findsNothing);
+    await closePreview(tester);
+    await browserAction(
+      tester,
+      'open-image',
+      legacy: find.byTooltip('添加镜像（可多选）'),
+    );
     await tester.pumpAndSettle();
-    expect(find.text('解锁 BitLocker 分区'), findsOneWidget);
-    await tester.tap(find.byKey(const ValueKey('image-tab-0')));
-    await tester.pumpAndSettle();
-    if (modalPreview) {
-      await tester.tap(find.text('can.txt'));
-      await tester.pumpAndSettle();
+    // Native startup is asynchronous. A saved device credential may also unlock
+    // this fixture automatically; leave the user's vault untouched in either case.
+    final lockedView = find.text('解锁 BitLocker 分区');
+    final unlockedFile = find.text('hello.txt');
+    for (
+      var i = 0;
+      i < 100 &&
+          lockedView.evaluate().isEmpty &&
+          unlockedFile.evaluate().isEmpty;
+      i++
+    ) {
+      await tester.pump(const Duration(milliseconds: 100));
     }
+    expect(find.text('bitlockervhdx.vhdx'), findsOneWidget);
+    expect(
+      lockedView.evaluate().isNotEmpty || unlockedFile.evaluate().isNotEmpty,
+      isTrue,
+      reason:
+          'The added encrypted image must show its unlock screen or successfully auto-unlock',
+    );
+    await switchImage(tester, 0);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('can.txt'));
+    await tester.pumpAndSettle();
     expect(find.byType(SelectableText), findsOneWidget);
     final output = fixtureSetting('VHDX_SCREENSHOT');
     if (output != null) {
@@ -126,37 +146,43 @@ void main() {
       await File(output).writeAsBytes(bytes!.buffer.asUint8List());
       image.dispose();
     }
-    if (modalPreview) {
-      Navigator.of(tester.element(find.byType(Dialog))).pop();
-      await tester.pumpAndSettle();
+    Future<void> captureView(String suffix) async {
+      if (output == null) return;
+      final boundary =
+          capture.currentContext!.findRenderObject()! as RenderRepaintBoundary;
+      final snapshot = await boundary.toImage();
+      final bytes = await snapshot.toByteData(format: ui.ImageByteFormat.png);
+      await File(
+        output.replaceFirst(RegExp(r'\.png$'), '.$suffix.png'),
+      ).writeAsBytes(bytes!.buffer.asUint8List());
+      snapshot.dispose();
     }
-    final closeOther = find.byKey(const ValueKey('close-tab-1'));
-    if (modalPreview) {
-      await tester.drag(
-        find.ancestor(of: closeOther, matching: find.byType(ListView)).first,
-        const Offset(-320, 0),
-      );
-      await tester.pumpAndSettle();
-    }
-    await tester.ensureVisible(closeOther);
+
+    await closePreview(tester);
+    await captureView('list');
+    await openReaderSettings(tester);
+    await captureView('settings');
+    await tester.tap(find.byKey(const Key('settings-back')));
     await tester.pumpAndSettle();
-    for (
-      var i = 0;
-      i < 50 && tester.widget<IconButton>(closeOther).onPressed == null;
-      i++
-    ) {
-      await tester.pump(const Duration(milliseconds: 100));
-    }
-    await tester.tap(closeOther);
+    await tester.tap(find.byKey(const Key('disk-navigation')));
     await tester.pumpAndSettle();
-    for (var i = 0; i < 50 && closeOther.evaluate().isNotEmpty; i++) {
-      await tester.pump(const Duration(milliseconds: 100));
-    }
-    expect(closeOther, findsNothing);
-    if (modalPreview) {
-      await tester.tap(find.text('can.txt'));
-      await tester.pumpAndSettle();
-    }
+    await captureView('images');
+    await tester.tap(find.byKey(const ValueKey('image-tab-0')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('display-menu')));
+    await tester.pumpAndSettle();
+    await captureView('menu');
+    await tester.tap(find.byKey(const Key('view-grid')));
+    await tester.pumpAndSettle();
+    await captureView('grid');
+    await tester.tap(find.text('can.txt'));
+    await tester.pumpAndSettle();
+    await closePreview(tester);
+    await switchImage(tester, 1);
+    await browserAction(tester, 'close-image');
+    expect(find.text('can.txt'), findsWidgets);
+    await tester.tap(find.text('can.txt'));
+    await tester.pumpAndSettle();
     expect(find.byType(SelectableText), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pumpAndSettle();

@@ -59,6 +59,15 @@ final class DocumentStorage: NSObject, FlutterPlugin, UIDocumentPickerDelegate {
     guard !detached else { fail(result, "closed", "读取组件已关闭。"); return }
     let args = call.arguments as? [String: Any] ?? [:]
     switch call.method {
+    case "screenDirection":
+      result(UserDefaults.standard.string(forKey: "reader_screen_direction") ?? "automatic")
+    case "setScreenDirection":
+      guard let value = args["value"] as? String,
+            ["automatic", "portrait", "landscape"].contains(value) else {
+        fail(result, "direction", "无效的屏幕方向。"); return
+      }
+      UserDefaults.standard.set(value, forKey: "reader_screen_direction")
+      result(nil)
     case "beginPlayback":
 #if targetEnvironment(simulator)
       // The pinned libmpv simulator slices disable every audio output driver.

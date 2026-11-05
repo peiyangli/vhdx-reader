@@ -27,6 +27,45 @@ use vhdx_core::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+#[derive(Clone, Copy, Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct CacheSettings {
+    plaintext_mib: usize,
+    ciphertext_mib: usize,
+}
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            plaintext_mib: 16,
+            ciphertext_mib: 1,
+        }
+    }
+}
+impl CacheSettings {
+    fn validate(&self) -> Result<()> {
+        if ![16, 32, 64, 128, 256].contains(&self.plaintext_mib)
+            || ![1, 2, 4, 8, 16].contains(&self.ciphertext_mib)
+        {
+            return Err(Error::Invalid("unsupported cache size".into()));
+        }
+        Ok(())
+    }
+    fn unlock(
+        &self,
+        image: &Image,
+        partition: u32,
+        credential: Option<&vhdx_core::native::Credential>,
+    ) -> Result<Volume> {
+        self.validate()?;
+        image.unlock_with_caches(
+            partition,
+            credential,
+            self.plaintext_mib * 1024 * 1024,
+            self.ciphertext_mib * 1024 * 1024,
+        )
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
@@ -43,6 +82,8 @@ enum Request {
     UnlockSaved {
         session: u64,
         partition: u32,
+        #[serde(default)]
+        cache: CacheSettings,
     },
     MediaOpen {
         session: u64,
@@ -81,6 +122,8 @@ enum Request {
         session: u64,
         partition: u32,
         mode: String,
+        #[serde(default)]
+        cache: CacheSettings,
         #[serde(default)]
         secret: Option<String>,
         #[serde(default)]
@@ -226,7 +269,10 @@ impl State {
                 let saved = vault::contains(&id)?;
                 Ok(json!({"available":true,"saved":saved,"id":id}))
             }
-            Request::UnlockSaved { partition, .. } => {
+            Request::UnlockSaved {
+                partition, cache, ..
+            } => {
+                cache.validate()?;
                 let image = self.image.as_ref().ok_or(Error::Locked)?;
                 let id = image.credential_id(*partition)?;
                 let saved = vault::get(&id)?;
@@ -235,11 +281,11 @@ impl State {
                 self.media.clear();
                 self.files.clear();
                 self.volume = None;
-                let volume = image.unlock(*partition, Some(&credential), 16 * 1024 * 1024)?;
+                let volume = cache.unlock(image, *partition, Some(&credential))?;
                 cancel.check()?;
                 let method = volume.encryption_method;
                 self.volume = Some(volume);
-                Ok(json!({"encryption_method":method,"automatic":true}))
+                Ok(json!({"encryption_method":method,"automatic":true,"cache":cache}))
             }
             Request::Open {
                 path,
@@ -298,8 +344,10 @@ impl State {
                 credential_fd,
                 remember,
                 label,
+                cache,
                 ..
             } => {
+                cache.validate()?;
                 if [
                     secret.is_some(),
                     credential_file.is_some(),
@@ -335,10 +383,10 @@ impl State {
                         false,
                     )?)
                 };
-                let volume = self.image.as_ref().ok_or(Error::Locked)?.unlock(
+                let volume = cache.unlock(
+                    self.image.as_ref().ok_or(Error::Locked)?,
                     *partition,
                     credential.as_ref(),
-                    16 * 1024 * 1024,
                 )?;
                 cancel.check()?;
                 let method = volume.encryption_method;
@@ -365,7 +413,7 @@ impl State {
                     None
                 };
                 Ok(
-                    json!({"encryption_method":method,"remembered":saved,"remember_error":remember_error}),
+                    json!({"encryption_method":method,"remembered":saved,"remember_error":remember_error,"cache":cache}),
                 )
             }
             Request::List {
@@ -745,7 +793,7 @@ pub extern "C" fn vhdx_context_create() -> u64 {
 }
 #[no_mangle]
 pub extern "C" fn vhdx_api_version() -> u32 {
-    6
+    7
 }
 fn failure(code: &str, message: &str) -> Value {
     json!({"ok":false,"error":{"code":code,"message":message}})
@@ -900,6 +948,45 @@ mod tests {
         let r = request_json(br#"{"op":"bad-sensitive-input"}"#);
         assert!(!r.to_string().contains("bad-sensitive-input"));
         assert_eq!(r["ok"], false);
+    }
+    #[test]
+    fn cache_settings_default_validate_and_cover_both_unlock_routes() {
+        for op in ["unlock", "unlock_saved"] {
+            let mut value = json!({"op":op,"session":0,"partition":1});
+            if op == "unlock" {
+                value["mode"] = json!("none");
+            }
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            let settings = match &request {
+                Request::Unlock { cache, .. } | Request::UnlockSaved { cache, .. } => cache,
+                _ => unreachable!(),
+            };
+            assert_eq!(settings.plaintext_mib, 16);
+            assert_eq!(settings.ciphertext_mib, 1);
+            for (plain, cipher) in [(64, 4), (256, 16)] {
+                value["cache"] = json!({"plaintext_mib":plain,"ciphertext_mib":cipher});
+                let request: Request = serde_json::from_value(value.clone()).unwrap();
+                let settings = match &request {
+                    Request::Unlock { cache, .. } | Request::UnlockSaved { cache, .. } => cache,
+                    _ => unreachable!(),
+                };
+                assert!(settings.validate().is_ok());
+                assert_eq!(settings.plaintext_mib, plain);
+            }
+            for cache in [
+                json!({"plaintext_mib":0}),
+                json!({"plaintext_mib":1024}),
+                json!({"ciphertext_mib":32}),
+            ] {
+                value["cache"] = cache;
+                let request: Request = serde_json::from_value(value.clone()).unwrap();
+                let error = State::new()
+                    .apply(&request, &Cancellation::default())
+                    .unwrap_err();
+                // Validation precedes image/vault access and allocation.
+                assert!(matches!(error, Error::Invalid(_)));
+            }
+        }
     }
     #[test]
     fn stale_session_cannot_access_new_volume() {

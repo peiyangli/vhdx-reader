@@ -1,3 +1,4 @@
+import '../test/ui_actions.dart';
 import 'test_configuration.dart';
 import 'dart:io';
 import 'package:flutter/material.dart';
@@ -7,6 +8,8 @@ import 'package:media_kit/media_kit.dart';
 import 'package:vhdx_reader/backend.dart';
 import 'package:vhdx_reader/main.dart';
 import 'package:vhdx_reader/media_preview.dart';
+import 'package:vhdx_reader/preview.dart';
+import 'package:vhdx_reader/screen_layout.dart';
 
 Future<void> waitFor(WidgetTester tester, bool Function() ready) async {
   for (var i = 0; i < 250; i++) {
@@ -19,7 +22,7 @@ Future<void> waitFor(WidgetTester tester, bool Function() ready) async {
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   testWidgets(
-    'real H264/AAC video plays and seeks through Rust ranges; tabs pause; close revokes',
+    'real H264/AAC fullscreen playback seeks; controls toggle; swipe exit revokes',
     (tester) async {
       final fixture = fixtureSetting('VHDX_MEDIA_FIXTURE');
       expect(fixture, isNotNull);
@@ -35,12 +38,14 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
+      await browserAction(tester, 'sort-name');
+      await browserAction(tester, 'order-ascending');
       await tester.tap(find.text('sample.mp4'));
       await waitFor(
         tester,
         () => find.byType(MediaPreview).evaluate().isNotEmpty,
       );
-      final source = tester
+      var source = tester
           .widget<MediaPreview>(find.byType(MediaPreview))
           .source;
       // Keep automated tests quiet; the fixture contains a real AAC tone track.
@@ -76,24 +81,107 @@ void main() {
         expect(png, isNotNull);
         await File(screenshotPath).writeAsBytes(png!);
       }
-      await tester.tap(find.byKey(const Key('media-fullscreen')));
+      expect(
+        find.byKey(const Key('disk-navigation')).hitTestable(),
+        findsNothing,
+      );
+      expect(find.byKey(const Key('media-fullscreen')), findsNothing);
+      expect(find.byKey(const Key('media-volume')), findsNothing);
+      final surface = find.byKey(const Key('media-surface'));
+      await tester.tapAt(tester.getCenter(surface));
       await tester.pumpAndSettle();
-      expect(find.byTooltip('退出全屏'), findsOneWidget);
-      await tester.tap(find.byTooltip('退出全屏'));
+      expect(find.byKey(const Key('media-play')).hitTestable(), findsNothing);
+      await tester.tapAt(tester.getCenter(surface));
       await tester.pumpAndSettle();
-      await source.toggle();
-      await waitFor(tester, () => source.playing);
-      await tester.tap(find.byTooltip('添加镜像（可多选）'));
+      expect(find.byKey(const Key('media-play')).hitTestable(), findsOneWidget);
+      await source.player.setRate(1.25);
+      final hold = await tester.startGesture(tester.getCenter(surface));
+      await tester.pump(const Duration(milliseconds: 650));
       await waitFor(
         tester,
-        () => find.text('can.txt').evaluate().isNotEmpty && !source.playing,
+        () => source.player.state.rate == 2 && source.playing,
       );
-      final position = source.position;
-      await tester.tap(find.byKey(const ValueKey('image-tab-0')));
-      await tester.pump(const Duration(milliseconds: 500));
-      expect(source.playing, isFalse);
-      expect((source.position - position).inMilliseconds.abs(), lessThan(500));
-      await tester.tap(find.text('返回文件列表'));
+      await hold.up();
+      await waitFor(
+        tester,
+        () => source.player.state.rate == 1.25 && !source.playing,
+      );
+      await source.player.setRate(1);
+      await source.seek(const Duration(seconds: 5));
+      await source.toggle();
+      await waitFor(tester, () => source.playing);
+      final pull = await tester.startGesture(tester.getCenter(surface));
+      await pull.moveBy(const Offset(0, 24));
+      await pull.moveBy(const Offset(0, 45));
+      await waitFor(tester, () => !source.playing);
+      await tester.pump();
+      expect(
+        tester
+            .widget<Opacity>(find.byKey(const Key('video-dismiss-opacity')))
+            .opacity,
+        lessThan(1),
+      );
+      expect(
+        tester
+            .widget<Transform>(find.byKey(const Key('video-dismiss-frame')))
+            .transform
+            .getTranslation()
+            .y,
+        greaterThan(0),
+      );
+      await pull.cancel();
+      await tester.pumpAndSettle();
+      await waitFor(tester, () => source.playing);
+      if (Platform.isIOS) {
+        final original = await ScreenDirection.load();
+        addTearDown(() => original.save());
+        for (final direction in [
+          ScreenDirection.landscape,
+          ScreenDirection.portrait,
+        ]) {
+          await direction.save();
+          await waitFor(
+            tester,
+            () =>
+                (tester.view.physicalSize.width >
+                    tester.view.physicalSize.height) ==
+                (direction == ScreenDirection.landscape),
+          );
+          expect(await ScreenDirection.load(), direction);
+          expect(
+            tester.widget<MediaPreview>(find.byType(MediaPreview)).source,
+            same(source),
+          );
+        }
+      }
+      await tester.dragFrom(tester.getCenter(surface), const Offset(-150, 0));
+      await tester.pump();
+      expect(find.text('已经是最后一个视频'), findsOneWidget);
+      final previous = source;
+      await tester.dragFrom(tester.getCenter(surface), const Offset(150, 0));
+      await waitFor(
+        tester,
+        () =>
+            tester.widget<PreviewPane>(find.byType(PreviewPane)).data!.name ==
+            'broken.mp4',
+      );
+      await expectLater(previous.statistics(), throwsA(isA<ReaderFailure>()));
+      await tester.dragFrom(tester.getCenter(surface), const Offset(-150, 0));
+      await waitFor(
+        tester,
+        () =>
+            tester.widget<PreviewPane>(find.byType(PreviewPane)).data!.name ==
+            'sample.mp4',
+      );
+      source = tester.widget<MediaPreview>(find.byType(MediaPreview)).source;
+      await waitFor(tester, () => source.duration.inSeconds >= 30);
+      expect(source.volume, 0);
+      expect(source.player.state.rate, 1);
+      final rect = tester.getRect(surface);
+      await tester.dragFrom(
+        Offset(rect.center.dx, rect.top + rect.height * 0.25),
+        const Offset(0, 200),
+      );
       await tester.pumpAndSettle();
       await expectLater(source.statistics(), throwsA(isA<ReaderFailure>()));
       await tester.ensureVisible(find.text('broken.mp4'));
@@ -105,7 +193,12 @@ void main() {
             find.textContaining('无法播放').evaluate().isNotEmpty ||
             find.textContaining('无法启动播放器').evaluate().isNotEmpty,
       );
-      await tester.tap(find.byKey(const ValueKey('close-tab-0')));
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
+      await browserAction(tester, 'open-image');
+      await tester.pumpAndSettle();
+      await switchImage(tester, 0);
+      await browserAction(tester, 'close-image');
       await tester.pumpAndSettle();
       expect(find.text('can.txt'), findsOneWidget);
       await tester.pumpWidget(const SizedBox.shrink());

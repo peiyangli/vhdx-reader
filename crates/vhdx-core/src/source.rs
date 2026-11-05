@@ -145,11 +145,47 @@ impl ReadAt for Slice {
 
 struct Page {
     bytes: zeroize::Zeroizing<Vec<u8>>,
-    touched: u64,
+    previous: Option<u64>,
+    next: Option<u64>,
 }
 struct Cache {
     pages: HashMap<u64, Page>,
-    tick: u64,
+    oldest: Option<u64>,
+    newest: Option<u64>,
+}
+impl Cache {
+    // Intrusive LRU links keep hits and evictions O(1), with no timestamp wrap.
+    fn unlink(&mut self, index: u64) {
+        let page = &self.pages[&index];
+        let (previous, next) = (page.previous, page.next);
+        if let Some(previous) = previous {
+            self.pages.get_mut(&previous).unwrap().next = next;
+        } else {
+            self.oldest = next;
+        }
+        if let Some(next) = next {
+            self.pages.get_mut(&next).unwrap().previous = previous;
+        } else {
+            self.newest = previous;
+        }
+    }
+    fn append(&mut self, index: u64) {
+        let page = self.pages.get_mut(&index).unwrap();
+        page.previous = self.newest;
+        page.next = None;
+        if let Some(newest) = self.newest {
+            self.pages.get_mut(&newest).unwrap().next = Some(index);
+        } else {
+            self.oldest = Some(index);
+        }
+        self.newest = Some(index);
+    }
+    fn touch(&mut self, index: u64) {
+        if self.newest != Some(index) {
+            self.unlink(index);
+            self.append(index);
+        }
+    }
 }
 /// A bounded plaintext page cache. Evicted pages are zeroized before deallocation.
 pub struct CachedReader {
@@ -171,7 +207,8 @@ impl CachedReader {
             capacity: budget / page_size,
             cache: RefCell::new(Cache {
                 pages: HashMap::new(),
-                tick: 0,
+                oldest: None,
+                newest: None,
             }),
         })
     }
@@ -194,21 +231,37 @@ impl ReadAt for CachedReader {
             let index = position / self.page_size as u64;
             let within = (position % self.page_size as u64) as usize;
             if !cache.pages.contains_key(&index) {
-                // Evict before allocating: memory remains bounded by budget + caller buffer.
-                if cache.pages.len() == self.capacity {
-                    let oldest = *cache.pages.iter().min_by_key(|(_, p)| p.touched).unwrap().0;
-                    cache.pages.remove(&oldest);
-                }
                 let start = index * self.page_size as u64;
                 let size = (self.len() - start).min(self.page_size as u64) as usize;
-                let mut bytes = zeroize::Zeroizing::new(vec![0; size]);
+                // Evict before allocating and reuse the allocation. Erase all old
+                // plaintext, including the tail when the next page is shorter.
+                let mut bytes = if cache.pages.len() == self.capacity {
+                    use zeroize::Zeroize;
+                    let oldest = cache.oldest.unwrap();
+                    cache.unlink(oldest);
+                    let mut bytes = cache.pages.remove(&oldest).unwrap().bytes;
+                    bytes.as_mut_slice().zeroize();
+                    bytes.resize(size, 0);
+                    bytes
+                } else {
+                    zeroize::Zeroizing::new(vec![0; size])
+                };
+                // A failed/short fill never becomes a cache hit; the temporary
+                // buffer is zeroized on error and the remaining LRU stays valid.
                 self.source.read_exact_at(start, &mut bytes)?;
-                cache.pages.insert(index, Page { bytes, touched: 0 });
+                cache.pages.insert(
+                    index,
+                    Page {
+                        bytes,
+                        previous: None,
+                        next: None,
+                    },
+                );
+                cache.append(index);
+            } else {
+                cache.touch(index);
             }
-            cache.tick = cache.tick.wrapping_add(1);
-            let tick = cache.tick;
-            let page = cache.pages.get_mut(&index).unwrap();
-            page.touched = tick;
+            let page = &cache.pages[&index];
             let n = (total - done).min(page.bytes.len() - within);
             buffer[done..done + n].copy_from_slice(&page.bytes[within..within + n]);
             done += n;
@@ -265,6 +318,81 @@ pub(crate) mod tests {
         cache.read_exact_at(0, &mut out[..1]).unwrap();
         assert_eq!(source.reads.get(), 5);
         assert!(cache.read_exact_at(u64::MAX, &mut out).is_err());
+    }
+    #[test]
+    fn cache_matches_reference_lru_across_capacity_and_partial_pages() {
+        use std::collections::VecDeque;
+        for capacity in 1..=5 {
+            let source = Rc::new(Counting {
+                memory: Memory((0..501).map(|n| (n % 251) as u8).collect()),
+                reads: Cell::new(0),
+            });
+            let cache = CachedReader::new(source.clone(), 17, capacity * 17).unwrap();
+            let mut recent = VecDeque::new();
+            let mut expected_reads = 0;
+            let mut state = 1u64;
+            for _ in 0..2000 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let offset = (state >> 32) as usize % 520;
+                let length = state as usize % 55;
+                let mut out = vec![0xff; length];
+                let n = cache.read_at(offset as u64, &mut out).unwrap();
+                let expected_len = length.min(501usize.saturating_sub(offset));
+                assert_eq!(n, expected_len);
+                if n > 0 {
+                    assert_eq!(out[..n], source.memory.0[offset..offset + n]);
+                    for page in offset / 17..=(offset + n - 1) / 17 {
+                        if let Some(at) = recent.iter().position(|p| *p == page) {
+                            recent.remove(at);
+                        } else {
+                            expected_reads += 1;
+                            if recent.len() == capacity {
+                                recent.pop_front();
+                            }
+                        }
+                        recent.push_back(page);
+                    }
+                }
+                assert_eq!(source.reads.get(), expected_reads);
+                assert_eq!(cache.cache.borrow().pages.len(), recent.len());
+            }
+        }
+    }
+    #[test]
+    fn failed_cache_fill_is_not_retained_and_lru_can_recover() {
+        struct Fallible {
+            fail: Cell<bool>,
+        }
+        impl ReadAt for Fallible {
+            fn len(&self) -> u64 {
+                130
+            }
+            fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize> {
+                // Return a partial read, then fail partway through a page fill.
+                if self.fail.get() && offset >= 70 {
+                    return Err(std::io::Error::other("disconnected").into());
+                }
+                let n = out.len().min(3).min((130 - offset) as usize);
+                out[..n].fill(42);
+                Ok(n)
+            }
+        }
+        let source = Rc::new(Fallible {
+            fail: Cell::new(true),
+        });
+        let cache = CachedReader::new(source.clone(), 64, 64).unwrap();
+        let mut out = [0; 64];
+        cache.read_exact_at(0, &mut out).unwrap();
+        assert!(cache.read_exact_at(64, &mut out).is_err());
+        assert!(cache.cache.borrow().pages.is_empty());
+        assert!(cache.cache.borrow().oldest.is_none());
+        assert!(cache.cache.borrow().newest.is_none());
+        source.fail.set(false);
+        cache.read_exact_at(64, &mut out).unwrap();
+        assert_eq!(out, [42; 64]);
+        assert_eq!(cache.read_at(128, &mut out).unwrap(), 2);
+        cache.read_exact_at(0, &mut out).unwrap();
+        assert_eq!(out, [42; 64]);
     }
     #[test]
     fn slice_never_exposes_next_partition() {
