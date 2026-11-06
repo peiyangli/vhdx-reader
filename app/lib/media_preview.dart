@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'platform_storage.dart';
 import 'playback_controls.dart';
+import 'media_playback_events.dart';
 import 'video_dismiss_view.dart';
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
@@ -29,23 +30,22 @@ class MediaPreviewSource extends ChangeNotifier {
         _changed();
       }),
       player.stream.playing.listen((value) {
-        playing = value;
+        playing = value && !_playbackFailed;
         _changed();
       }),
       player.stream.buffering.listen((value) {
-        buffering = value;
+        buffering = value && !_playbackFailed;
         _changed();
       }),
       player.stream.volume.listen((value) {
         volume = value;
         _changed();
       }),
-      player.stream.error.listen((_) {
-        error = '无法播放此文件，请检查格式或存储设备后重试。';
-        _changed();
-      }),
     ]);
   }
+  static const _playbackFailure = '无法播放此文件，请检查格式或存储设备后重试。';
+  MediaPlaybackEvents? _playbackEvents;
+  bool _playbackFailed = false;
   final bool _ownsPlaybackSession;
   bool get audioOutputAvailable => !Platform.isIOS || _ownsPlaybackSession;
   final ReaderBackend backend;
@@ -107,6 +107,26 @@ class MediaPreviewSource extends ChangeNotifier {
         player,
         controller,
         audioAcquired,
+      );
+      final opened = source;
+      source._playbackEvents = MediaPlaybackEvents(
+        native,
+        onFailure: () {
+          if (opened._disposed) return;
+          opened._playbackFailed = true;
+          opened.error = _playbackFailure;
+          opened.playing = false;
+          opened.buffering = false;
+          opened._changed();
+        },
+        onPlaybackRestart: () {
+          if (opened._disposed) return;
+          opened._playbackFailed = false;
+          if (opened.error == _playbackFailure) opened.error = null;
+          opened.playing = opened.player.state.playing;
+          opened.buffering = opened.player.state.buffering;
+          opened._changed();
+        },
       );
       // add uses loadfile directly; open writes a temporary playlist to disk.
       await player.add(Media(media['url'] as String));
@@ -248,6 +268,7 @@ class MediaPreviewSource extends ChangeNotifier {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _playbackEvents?.dispose();
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
     }
