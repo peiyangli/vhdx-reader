@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use vhdx_core::{native::Credential, Error, Result};
 use zeroize::{Zeroize, Zeroizing};
 
+pub mod authentication;
+
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 mod apple;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -123,10 +125,12 @@ pub fn contains(id: &str) -> Result<bool> {
     Ok(Vault::load()?.entries.contains_key(id))
 }
 pub fn get(id: &str) -> Result<Saved> {
-    Vault::load()?
-        .entries
-        .remove(id)
-        .ok_or(error("vault_missing"))
+    authentication::read(|| {
+        Vault::load()?
+            .entries
+            .remove(id)
+            .ok_or(error("vault_missing"))
+    })
 }
 pub fn save(id: &str, label: &str, credential: &Credential) -> Result<()> {
     if !valid_id(id) {

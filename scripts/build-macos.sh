@@ -2,6 +2,7 @@
 set -euo pipefail
 [[ "$(uname -s)" == Darwin ]] || { echo 'Run this script on the Mac.' >&2; exit 1; }
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+artifact_dir="${VHDX_ARTIFACT_DIR:-$repo_root/artifacts}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
 export MACOSX_DEPLOYMENT_TARGET=12.0
 export PUB_CACHE="$repo_root/.tools/pub-cache-macos"
@@ -59,8 +60,8 @@ configuration=Release
 if [[ "$mode" == debug ]]; then configuration=Debug; fi
 application="$repo_root/app/build/macos/Build/Products/$configuration/VHDX Reader.app"
 python3 "$repo_root/scripts/verify-macos.py" "$application" "$arch"
-mkdir -p "$repo_root/artifacts"
-archive="$repo_root/artifacts/vhdx-reader-macos-$arch-$mode.zip"
+mkdir -p "$artifact_dir"
+archive="$artifact_dir/vhdx-reader-macos-$arch-$mode.zip"
 ditto -c -k --sequesterRsrc --keepParent "$application" "$archive"
 shasum -a 256 "$archive" > "$archive.sha256"
 echo "macOS app (development signing): $application"

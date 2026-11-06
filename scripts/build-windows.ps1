@@ -1,6 +1,7 @@
-param([switch]$Offline, [switch]$SkipNative)
+param([switch]$Offline, [switch]$SkipNative, [string]$ArtifactDirectory)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
+if (-not $ArtifactDirectory) { $ArtifactDirectory = "$root\artifacts" }
 Set-Location $root
 if (-not $SkipNative) {
     & (Join-Path $PSScriptRoot 'prepare-native-windows.ps1')
@@ -20,7 +21,7 @@ $cargoArgs = @('build', '--release', '--locked')
 if ($Offline) { $cargoArgs += '--offline' }
 & cargo @cargoArgs
 if ($LASTEXITCODE -ne 0) { throw 'Rust build failed' }
-$package = "$root\artifacts\windows-x64"
+$package = Join-Path $ArtifactDirectory "windows-x64"
 [IO.Directory]::CreateDirectory("$package\native") | Out-Null
 [IO.Directory]::CreateDirectory("$package\licenses") | Out-Null
 Copy-Item "$root\target\windows\release\vhdx.exe" "$package\vhdx.exe"
@@ -36,5 +37,5 @@ Copy-Item "$PSScriptRoot\native-sources.json" "$package\licenses\native-sources.
 & "$package\vhdx.exe" doctor
 if ($LASTEXITCODE -ne 0) { throw 'Packaged executable could not load native dependencies' }
 Write-Output "Windows package: $package"
-$archive = "$root\artifacts\vhdx-reader-windows-x64.zip"
+$archive = Join-Path $ArtifactDirectory "vhdx-reader-windows-x64.zip"
 & "$PSScriptRoot\package-windows.ps1" -Directory $package -Archive $archive

@@ -38,6 +38,9 @@ fn with_env<T>(f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<T>) 
     }
     result.map_err(|_| error("vault_unavailable"))
 }
+pub fn authenticate() -> Result<i32> {
+    with_env(|env, object| env.call_method(object, "authenticate", "()I", &[])?.i())
+}
 pub fn load() -> Result<Option<Zeroizing<Vec<u8>>>> {
     with_env(|env, object| {
         let raw = env.call_method(object, "load", "()[B", &[])?.l()?;

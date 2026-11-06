@@ -56,6 +56,7 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         val nativeReady = try { System.loadLibrary("vhdx_app"); true } catch (_: UnsatisfiedLinkError) { false }
+        VaultAuthentication.attach(this)
         if (nativeReady) installVault(CredentialVault(applicationContext))
         fun releaseEngineResources() {
             val watermark = if (nativeReady) contextWatermark() else 0L
@@ -186,6 +187,7 @@ class MainActivity : FlutterActivity() {
     @Deprecated("Android activity result bridge for Flutter")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (VaultAuthentication.onActivityResult(this, requestCode, resultCode)) return
         if (requestCode != PICK) return
         val result = pending ?: return
         pending = null
@@ -212,6 +214,7 @@ class MainActivity : FlutterActivity() {
         }
     }
     override fun onDestroy() {
+        VaultAuthentication.detach(this)
         pending?.error("closed", "文件选择已取消。", null)
         pending = null
         super.onDestroy()

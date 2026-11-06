@@ -2,6 +2,7 @@
 set -euo pipefail
 [[ "$(uname -s)" == Darwin ]] || { echo 'Run on macOS with Xcode.' >&2; exit 1; }
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+artifact_dir="${VHDX_ARTIFACT_DIR:-$repo_root/artifacts}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
 export PUB_CACHE="$repo_root/.tools/pub-cache-macos"
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.96.1}"
@@ -25,11 +26,11 @@ cd app
 python3 "$repo_root/scripts/prepare-apple-deps.py" --ios
 "$FLUTTER" build ios --simulator --debug
 python3 "$repo_root/scripts/verify-ios.py" build/ios/iphonesimulator/Runner.app IOSSIMULATOR
-mkdir -p "$repo_root/artifacts"
-ditto -c -k --sequesterRsrc --keepParent build/ios/iphonesimulator/Runner.app "$repo_root/artifacts/vhdx-reader-ios-simulator-arm64.zip"
+mkdir -p "$artifact_dir"
+ditto -c -k --sequesterRsrc --keepParent build/ios/iphonesimulator/Runner.app "$artifact_dir/vhdx-reader-ios-simulator-arm64.zip"
 # A real device build can be validated without an Apple account; installation needs signing.
 "$FLUTTER" build ios --release --no-codesign
 python3 "$repo_root/scripts/verify-ios.py" build/ios/iphoneos/Runner.app IOS
-ditto -c -k --sequesterRsrc --keepParent build/ios/iphoneos/Runner.app "$repo_root/artifacts/vhdx-reader-ios-device-arm64-unsigned.zip"
+ditto -c -k --sequesterRsrc --keepParent build/ios/iphoneos/Runner.app "$artifact_dir/vhdx-reader-ios-device-arm64-unsigned.zip"
 
-(cd "$repo_root/artifacts" && shasum -a 256 vhdx-reader-ios-simulator-arm64.zip vhdx-reader-ios-device-arm64-unsigned.zip > vhdx-reader-ios.sha256)
+(cd "$artifact_dir" && shasum -a 256 vhdx-reader-ios-simulator-arm64.zip vhdx-reader-ios-device-arm64-unsigned.zip > vhdx-reader-ios.sha256)

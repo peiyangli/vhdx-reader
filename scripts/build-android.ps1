@@ -3,6 +3,7 @@ param(
     [switch]$Offline,
     [switch]$DebugBuild,
     [switch]$Preview,
+    [string]$ArtifactDirectory,
     [string]$AndroidSdk = "$env:LOCALAPPDATA\Android\Sdk",
     [string]$MsysRoot = 'C:\msys64',
     [string]$JavaHome = 'C:\Program Files\Android\Android Studio\jbr'
@@ -10,6 +11,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\file-sha256.ps1"
 $root = Split-Path $PSScriptRoot -Parent
+if (-not $ArtifactDirectory) { $ArtifactDirectory = "$root\artifacts" }
 $ndk = "$AndroidSdk\ndk\27.3.13750724"
 if (-not (Test-Path "$ndk\source.properties")) { throw 'Install Android NDK 27.3.13750724 first' }
 $env:JAVA_HOME = $JavaHome
@@ -110,9 +112,9 @@ $lines = if (Test-Path $properties) { @(Get-Content $properties | Where-Object {
 # --no-pub would retain debug-only integration_test registration in a release build.
 & $flutter build apk "--$mode" --target-platform android-arm64
 if ($LASTEXITCODE -ne 0) { throw 'Android APK build failed' }
-[IO.Directory]::CreateDirectory("$root\artifacts") | Out-Null
+[IO.Directory]::CreateDirectory($ArtifactDirectory) | Out-Null
 $artifactName = if ($Preview -and -not $DebugBuild) { "ui-preview" } else { $mode }
-$output = "$root\artifacts\vhdx-reader-android-arm64-$artifactName.apk"
+$output = Join-Path $ArtifactDirectory "vhdx-reader-android-arm64-$artifactName.apk"
 & "$PSScriptRoot\verify-android-apk.ps1" -Apk "$root\app\build\app\outputs\flutter-apk\app-$mode.apk"
 Copy-Item "$root\app\build\app\outputs\flutter-apk\app-$mode.apk" $output -Force
 $outputHash = Get-ArchiveSha256 $output

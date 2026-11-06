@@ -1,7 +1,8 @@
-param([switch]$Offline, [switch]$SkipNative, [string]$FlutterPath, [switch]$Preview, [string]$PackageDirectory, [string]$ArchivePath)
+param([switch]$Offline, [switch]$SkipNative, [string]$FlutterPath, [switch]$Preview, [string]$PackageDirectory, [string]$ArchivePath, [string]$NativeArtifactDirectory)
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\file-sha256.ps1"
 $root = Split-Path $PSScriptRoot -Parent
+if (-not $NativeArtifactDirectory) { $NativeArtifactDirectory = "$root\artifacts" }
 if (-not $FlutterPath) {
     & "$PSScriptRoot\install-flutter-windows.ps1"
     $FlutterPath = "$root\.tools\flutter\bin\flutter.bat"
@@ -9,7 +10,7 @@ if (-not $FlutterPath) {
 $env:PUB_CACHE = "$root\.tools\pub-cache"
 $env:FLUTTER_SUPPRESS_ANALYTICS = 'true'
 $env:CI = 'true'
-& "$PSScriptRoot\build-windows.ps1" -Offline:$Offline -SkipNative:$SkipNative
+& "$PSScriptRoot\build-windows.ps1" -Offline:$Offline -SkipNative:$SkipNative -ArtifactDirectory $NativeArtifactDirectory
 Set-Location "$root\app"
 $pubArgs = @('pub','get')
 if ($Offline) { $pubArgs += '--offline' }
@@ -23,7 +24,7 @@ $package = if ($PackageDirectory) { $PackageDirectory } elseif ($Preview) { "$ro
 [IO.Directory]::CreateDirectory($package) | Out-Null
 Copy-Item "$root\app\build\windows\x64\runner\Release\*" $package -Recurse -Force
 Copy-Item "$root\README.md","$root\THIRD_PARTY.md","$root\LICENSE" $package -Force
-Copy-Item "$root\artifacts\windows-x64\licenses" $package -Recurse -Force
+Copy-Item "$NativeArtifactDirectory\windows-x64\licenses" $package -Recurse -Force
 $pdfium = "$root\.native\pdfium-win-x64"
 # Verify that Flutter's downloaded native asset matches the independently pinned archive.
 $sha = [Security.Cryptography.SHA256]::Create()

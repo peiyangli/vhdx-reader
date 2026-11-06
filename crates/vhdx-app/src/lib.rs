@@ -267,7 +267,9 @@ impl State {
                     }
                 };
                 let saved = vault::contains(&id)?;
-                Ok(json!({"available":true,"saved":saved,"id":id}))
+                Ok(
+                    json!({"available":true,"saved":saved,"id":id,"authentication_required":vault::authentication::required()}),
+                )
             }
             Request::UnlockSaved {
                 partition, cache, ..
@@ -628,6 +630,9 @@ impl State {
                             "vault_locked" => {
                                 "设备安全存储已锁定，请解锁设备后重试，或手动输入密码。"
                             }
+                            "vault_auth_cancelled" => "身份验证未完成，可重试或手动输入 BitLocker 密码。",
+                            "vault_auth_unavailable" => "无法进行身份验证，请先设置设备锁屏密码，或手动输入 BitLocker 密码。",
+                            "vault_auth_busy" => "其他解锁操作正在验证身份，请完成后重试。",
                             "vault_missing" => "此卷没有已保存的解锁信息，请手动输入。",
                             "vault_corrupt" => {
                                 "保存的解锁信息无法读取；可以手动解锁，或在管理页清除后重新保存。"

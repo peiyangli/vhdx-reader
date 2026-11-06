@@ -521,6 +521,9 @@ class _ReaderHomeState extends State<ReaderHome> {
   bool _descending = false;
   String _mode = 'password';
   String? _credentialFile;
+  bool get _mobileCredentialProtection =>
+      widget.platform == TargetPlatform.android ||
+      widget.platform == TargetPlatform.iOS;
   bool _remember = false;
   bool _vaultAvailable = false;
   bool _savedCredential = false;
@@ -685,10 +688,16 @@ class _ReaderHomeState extends State<ReaderHome> {
           'partition': index,
         });
         if (!mounted) return;
+        final protectionMissing =
+            _mobileCredentialProtection &&
+            status['available'] == true &&
+            status['authentication_required'] != true;
         setState(() {
-          _vaultAvailable = status['available'] == true;
-          _savedCredential = status['saved'] == true;
-          _vaultNote = status['reason'] as String?;
+          _vaultAvailable = status['available'] == true && !protectionMissing;
+          _savedCredential = status['saved'] == true && !protectionMissing;
+          _vaultNote = protectionMissing
+              ? '读取组件尚不支持身份验证，请更新完整应用；当前可手动解锁。'
+              : status['reason'] as String?;
         });
         if (_savedCredential &&
             !_manuallyLocked.contains(index) &&
@@ -1182,20 +1191,35 @@ class _ReaderHomeState extends State<ReaderHome> {
                 onChanged: _busy || !_vaultAvailable
                     ? null
                     : (value) => setState(() => _remember = value ?? false),
-                title: const Text(
-                  '在此设备记住，下次自动解锁',
-                  style: TextStyle(fontSize: 13),
+                title: Text(
+                  _mobileCredentialProtection
+                      ? '在此设备记住，验证身份后解锁'
+                      : '在此设备记住，下次自动解锁',
+                  style: const TextStyle(fontSize: 13),
                 ),
                 subtitle: Text(
-                  _vaultAvailable ? '仅在解锁成功后保存到设备安全存储。' : '此设备的安全存储或卷身份暂不可用。',
+                  !_vaultAvailable
+                      ? '此设备的安全存储或卷身份暂不可用。'
+                      : _mobileCredentialProtection
+                      ? '仅在解锁成功后保存；每次使用需通过系统人脸、指纹或锁屏密码验证。'
+                      : '仅在解锁成功后保存到设备安全存储。',
                   style: const TextStyle(fontSize: 11),
                 ),
               ),
               if (_savedCredential)
                 TextButton(
                   key: const Key('unlock-saved'),
-                  onPressed: _busy ? null : () => _run('正在自动解锁…', _unlockSaved),
-                  child: const Text('使用已保存信息解锁'),
+                  onPressed: _busy
+                      ? null
+                      : () => _run(
+                          _mobileCredentialProtection
+                              ? '请完成系统身份验证…'
+                              : '正在自动解锁…',
+                          _unlockSaved,
+                        ),
+                  child: Text(
+                    _mobileCredentialProtection ? '验证身份并解锁' : '使用已保存信息解锁',
+                  ),
                 ),
               if (_vaultNote != null)
                 Text(

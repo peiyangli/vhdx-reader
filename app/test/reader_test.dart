@@ -55,6 +55,109 @@ class FakeBackend implements ReaderBackend {
 }
 
 void main() {
+  testWidgets(
+    'old mobile native library cannot silently bypass device authentication',
+    (tester) async {
+      final backend = VaultBackend()
+        ..saved = true
+        ..supportsDeviceAuthentication = false;
+      await tester.pumpWidget(
+        ReaderApp(
+          backend: backend,
+          initialImage: 'saved.vhdx',
+          platform: TargetPlatform.android,
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(backend.ops.where((op) => op == 'unlock_saved'), isEmpty);
+      expect(find.byKey(const Key('unlock-saved')), findsNothing);
+      expect(
+        tester
+            .widget<CheckboxListTile>(
+              find.byKey(const Key('remember-credential')),
+            )
+            .onChanged,
+        isNull,
+      );
+      expect(find.textContaining('读取组件尚不支持身份验证'), findsOneWidget);
+      expect(find.byKey(const Key('unlock-secret')), findsOneWidget);
+    },
+  );
+
+  for (final platform in [TargetPlatform.android, TargetPlatform.iOS]) {
+    for (final code in [
+      'vault_auth_cancelled',
+      'vault_auth_unavailable',
+      'vault_auth_busy',
+    ]) {
+      testWidgets(
+        '$platform $code keeps saved unlock locked until retry succeeds',
+        (tester) async {
+          tester.view.physicalSize = const Size(1400, 1000);
+          tester.view.devicePixelRatio = 1;
+          addTearDown(tester.view.resetPhysicalSize);
+          addTearDown(tester.view.resetDevicePixelRatio);
+          final backend = VaultBackend()
+            ..saved = true
+            ..authError = code;
+          await tester.pumpWidget(
+            ReaderApp(
+              backend: backend,
+              initialImage: 'saved.vhdx',
+              platform: platform,
+            ),
+          );
+          await tester.pumpAndSettle();
+          expect(find.text('notes.txt'), findsNothing);
+          expect(find.text('在此设备记住，验证身份后解锁'), findsOneWidget);
+          expect(find.text('验证身份并解锁'), findsOneWidget);
+          expect(backend.saved, isTrue);
+          expect(backend.ops.where((op) => op == 'unlock_saved').length, 1);
+          expect(
+            tester
+                .widget<TextField>(find.byKey(const Key('unlock-secret')))
+                .controller!
+                .text,
+            isEmpty,
+          );
+          backend.authError = null;
+          await tester.tap(find.byKey(const Key('unlock-saved')));
+          await tester.pumpAndSettle();
+          expect(find.text('notes.txt'), findsOneWidget);
+          expect(backend.ops.where((op) => op == 'unlock_saved').length, 2);
+        },
+      );
+    }
+  }
+  testWidgets(
+    'manual password remains usable after cancelled device authentication',
+    (tester) async {
+      final backend = VaultBackend()
+        ..saved = true
+        ..authError = 'vault_auth_cancelled'
+        ..reject = false;
+      await tester.pumpWidget(
+        ReaderApp(
+          backend: backend,
+          initialImage: 'saved.vhdx',
+          platform: TargetPlatform.android,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const Key('unlock-secret')),
+        'fixture-only',
+      );
+      await tester.ensureVisible(find.byKey(const Key('unlock-button')));
+      await tester.tap(find.byKey(const Key('unlock-button')));
+      await tester.pumpAndSettle();
+      expect(find.text('notes.txt'), findsOneWidget);
+      expect(backend.ops.where((op) => op == 'unlock_saved').length, 1);
+      expect(backend.lastRemember, isFalse);
+      expect(backend.saved, isTrue);
+    },
+  );
+
   testWidgets('automatic unlock invalidation clears the stale image', (
     tester,
   ) async {
@@ -348,7 +451,9 @@ void main() {
 
 class VaultBackend extends FakeBackend {
   bool saved = false;
+  bool supportsDeviceAuthentication = true;
   bool autoReject = false;
+  String? authError;
   bool saveFails = false;
   bool invalidateAuto = false;
   bool? lastRemember;
@@ -357,11 +462,19 @@ class VaultBackend extends FakeBackend {
   Future<Map<String, dynamic>> request(Map<String, dynamic> request) async {
     switch (request['op']) {
       case 'vault_status':
-        return {'available': true, 'saved': saved, 'id': id};
+        return {
+          'available': true,
+          'saved': saved,
+          'id': id,
+          if (supportsDeviceAuthentication) 'authentication_required': true,
+        };
       case 'unlock_saved':
         ops.add('unlock_saved');
         if (invalidateAuto) {
           throw ReaderFailure('io', '设备已断开', invalidated: true);
+        }
+        if (authError != null) {
+          throw ReaderFailure(authError!, '身份验证未完成，可重试或手动输入 BitLocker 密码。');
         }
         if (autoReject) throw ReaderFailure('wrong_credential', 'wrong');
         return {};

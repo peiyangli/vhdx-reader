@@ -24,7 +24,11 @@ class CacheBackend extends FakeBackend {
       };
     }
     if (request['op'] == 'vault_status') {
-      return {'available': true, 'saved': saved};
+      return {
+        'available': true,
+        'saved': saved,
+        'authentication_required': true,
+      };
     }
     if (request['op'] == 'unlock' || request['op'] == 'unlock_saved') {
       caches.add(Map<String, dynamic>.from(request['cache'] as Map));

@@ -21,6 +21,7 @@ class CredentialVault(context: Context) {
     private val file = AtomicFile(File(context.noBackupFilesDir, "bitlocker-vault-v1.aes"))
     private val alias = "org.vhdxreader.bitlocker.vault.v1"
     private val aad = alias.toByteArray(Charsets.UTF_8)
+    fun authenticate(): Int = VaultAuthentication.authenticate()
     fun isUnlocked(): Boolean = !keyguard.isDeviceLocked
     private fun store(): KeyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
     private fun key(create: Boolean): SecretKey {
