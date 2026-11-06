@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/material.dart';
 import 'package:vhdx_reader/backend.dart';
 import 'package:vhdx_reader/cache_settings.dart';
 import 'package:vhdx_reader/thumbnails.dart';
@@ -64,6 +65,30 @@ Map<String, dynamic> entry(Uint8List bytes) => {
   'size': bytes.length,
   'modified_unix_ms': 1,
 };
+
+Future<void> waitForDisk(Directory directory) async {
+  for (var i = 0; i < 100; i++) {
+    if ((await directory.list().toList()).whereType<File>().any(
+      (f) => f.path.endsWith('.thumb'),
+    )) {
+      return;
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+  fail('Thumbnail was not persisted');
+}
+
+Future<Thumbnail> testThumbnail(Uint8List bytes) async {
+  final codec = await ui.instantiateImageCodec(bytes);
+  try {
+    return Thumbnail(
+      (await codec.getNextFrame()).image,
+      const Duration(seconds: 3),
+    );
+  } finally {
+    codec.dispose();
+  }
+}
 
 void main() {
   test(
@@ -156,6 +181,7 @@ void main() {
         try {
           (await cache.request(scope, '/photo.png', entry(bytes)).future)
               ?.dispose();
+          await waitForDisk(directory);
           expect((await directory.list().toList()).length, 1);
           scope.invalidate();
           expect(
@@ -216,4 +242,195 @@ void main() {
       });
     },
   );
+  testWidgets('cached video bypasses a blocked video decoder', (tester) async {
+    await tester.runAsync(() async {
+      final bytes = await png();
+      final directory = await Directory.systemTemp.createTemp(
+        'thumbnail-priority-',
+      );
+      final blocked = Completer<Thumbnail?>();
+      final started = Completer<void>();
+      var generated = 0;
+      final cache = ThumbnailCache(
+        directory: directory,
+        settings: const CacheSettings(bitLockerThumbnailDisk: true),
+        generator: (scope, path, entry) async {
+          generated++;
+          if (path == '/slow.mp4') {
+            started.complete();
+            return blocked.future;
+          }
+          return testThumbnail(bytes);
+        },
+      );
+      final backend = ImageBackend(bytes);
+      final file = {...entry(bytes), 'name': 'cached.mp4'};
+      final warm = ThumbnailScope(
+        cache,
+        backend,
+        'same-source',
+        encrypted: true,
+      );
+      ThumbnailRequest? slow;
+      try {
+        (await cache.request(warm, '/cached.mp4', file).future)?.dispose();
+        await waitForDisk(directory);
+        warm.invalidate();
+        final reopened = ThumbnailScope(
+          cache,
+          backend,
+          'same-source',
+          encrypted: true,
+        );
+        slow = cache.request(reopened, '/slow.mp4', {
+          ...file,
+          'name': 'slow.mp4',
+        });
+        await started.future;
+        final value = await cache
+            .request(reopened, '/cached.mp4', file)
+            .future
+            .timeout(const Duration(seconds: 1));
+        expect(value, isNotNull);
+        value?.dispose();
+        expect(generated, 2, reason: 'Cached video must not be regenerated');
+      } finally {
+        blocked.complete(null);
+        await slow?.future;
+        cache.dispose();
+        await directory.delete(recursive: true);
+      }
+    });
+  });
+
+  testWidgets('visible thumbnail retries a transient failure without refresh', (
+    tester,
+  ) async {
+    final bytes = (await tester.runAsync(png))!;
+    final template = (await tester.runAsync(() => testThumbnail(bytes)))!;
+    var attempts = 0;
+    final cache = ThumbnailCache(
+      generator: (_, path, entry) async =>
+          ++attempts == 1 ? null : template.clone(),
+    );
+    final scope = ThumbnailScope(
+      cache,
+      ImageBackend(bytes),
+      'retry',
+      encrypted: true,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: FileThumbnail(
+          entry: entry(bytes),
+          path: '/photo.png',
+          size: const Size(64, 32),
+          scope: scope,
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump();
+    expect(attempts, 1);
+    expect(find.byType(RawImage), findsNothing);
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 1100)),
+    );
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump();
+    expect(attempts, 2);
+    expect(find.byType(RawImage), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+    scope.invalidate();
+    cache.dispose();
+    template.dispose();
+  });
+
+  testWidgets('broken media retries are bounded and stop on lock', (
+    tester,
+  ) async {
+    final bytes = (await tester.runAsync(png))!;
+    var attempts = 0;
+    final cache = ThumbnailCache(
+      generator: (_, path, entry) async {
+        attempts++;
+        return null;
+      },
+    );
+    final scope = ThumbnailScope(
+      cache,
+      ImageBackend(bytes),
+      'broken',
+      encrypted: true,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: FileThumbnail(
+          entry: entry(bytes),
+          path: '/photo.png',
+          size: const Size(64, 32),
+          scope: scope,
+        ),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 1100)),
+    );
+    await tester.pump(const Duration(seconds: 1));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 3100)),
+    );
+    await tester.pump(const Duration(seconds: 3));
+    await tester.pump(const Duration(seconds: 30));
+    expect(attempts, 3);
+    scope.invalidate();
+    await tester.pump(const Duration(seconds: 30));
+    expect(attempts, 3);
+    await tester.pumpWidget(const SizedBox.shrink());
+    cache.dispose();
+  });
+
+  testWidgets('metadata-equivalent rebuild preserves in-flight thumbnail', (
+    tester,
+  ) async {
+    final bytes = (await tester.runAsync(png))!;
+    final template = (await tester.runAsync(() => testThumbnail(bytes)))!;
+    final gate = Completer<void>();
+    var attempts = 0;
+    final cache = ThumbnailCache(
+      generator: (_, path, entry) async {
+        attempts++;
+        await gate.future;
+        return template.clone();
+      },
+    );
+    final scope = ThumbnailScope(
+      cache,
+      ImageBackend(bytes),
+      'rebuild',
+      encrypted: true,
+    );
+    Widget tile() => MaterialApp(
+      home: FileThumbnail(
+        entry: entry(bytes),
+        path: '/photo.png',
+        size: const Size(64, 32),
+        scope: scope,
+      ),
+    );
+    await tester.pumpWidget(tile());
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pumpWidget(tile());
+    await tester.pump(const Duration(milliseconds: 100));
+    gate.complete();
+    await tester.pump();
+    await tester.pump();
+    expect(attempts, 1);
+    expect(find.byType(RawImage), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+    scope.invalidate();
+    cache.dispose();
+    template.dispose();
+  });
 }

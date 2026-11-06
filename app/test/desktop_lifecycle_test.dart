@@ -43,6 +43,16 @@ void main() {
         await tester.pumpAndSettle();
       }
 
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<ReaderHome>(find.byType(ReaderHome)).active,
+        isTrue,
+        reason:
+            'A visible desktop window remains active without keyboard focus',
+      );
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pumpAndSettle();
       await event('hidden');
       expect(
         tester.widget<ReaderHome>(find.byType(ReaderHome)).active,

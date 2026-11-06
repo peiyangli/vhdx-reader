@@ -193,7 +193,17 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (mounted) {
-      setState(() => _foreground = state == AppLifecycleState.resumed);
+      // Desktop inactive means unfocused, not hidden. Treating focus changes
+      // as backgrounding repeatedly cancels visible thumbnail work.
+      final desktop =
+          widget.platform == TargetPlatform.windows ||
+          widget.platform == TargetPlatform.macOS ||
+          widget.platform == TargetPlatform.linux;
+      setState(
+        () => _foreground =
+            state == AppLifecycleState.resumed ||
+            (desktop && state == AppLifecycleState.inactive),
+      );
     }
   }
 

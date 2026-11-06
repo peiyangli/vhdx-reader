@@ -69,6 +69,7 @@ class MediaPreviewSource extends ChangeNotifier {
     ReaderBackend backend,
     String path, {
     bool thumbnail = false,
+    void Function(Object)? onDiagnostic,
   }) async {
     final media = await backend.request({'op': 'media_open', 'path': path});
     Player? player;
@@ -93,7 +94,10 @@ class MediaPreviewSource extends ChangeNotifier {
             ? VideoControllerConfiguration(
                 width: 320,
                 height: 180,
-                hwdec: Platform.isAndroid ? 'no' : null,
+                hwdec: Platform.isAndroid || Platform.isWindows ? 'no' : null,
+                // Short-lived Windows thumbnail players do not need a GPU
+                // context. Software output avoids repeated driver startup.
+                enableHardwareAcceleration: !Platform.isWindows,
               )
             : const VideoControllerConfiguration(),
       );
@@ -134,6 +138,9 @@ class MediaPreviewSource extends ChangeNotifier {
         controller,
         audioAcquired,
       );
+      if (onDiagnostic != null) {
+        source._subscriptions.add(player.stream.error.listen(onDiagnostic));
+      }
       final opened = source;
       source._playbackEvents = MediaPlaybackEvents(
         native,
