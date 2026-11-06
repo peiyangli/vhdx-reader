@@ -7,6 +7,8 @@
 #include <flutter/encodable_value.h>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "win32_window.h"
 
@@ -16,6 +18,7 @@ class FlutterWindow : public Win32Window {
   // Creates a new FlutterWindow hosting a Flutter view running |project|.
   explicit FlutterWindow(const flutter::DartProject& project);
   virtual ~FlutterWindow();
+  void QueueLaunchPaths(const std::vector<std::string>& paths);
 
  protected:
   // Win32Window:
@@ -25,6 +28,9 @@ class FlutterWindow : public Win32Window {
                          LPARAM const lparam) noexcept override;
 
  private:
+  bool dart_ready_ = false;
+  std::vector<std::string> launch_paths_;
+  void FlushLaunchPaths();
   bool tray_ready_ = false;
   bool quitting_ = false;
   bool hidden_ = false;

@@ -76,6 +76,33 @@ final class RunnerTests: XCTestCase {
     wait(for: [done], timeout: 10)
   }
 
+  func testRecentBookmarkRestoresAfterStorageRecreation() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let image = folder.appendingPathComponent("recent.vhdx")
+    try Data("image".utf8).write(to: image)
+    let original = DocumentStorage()
+    let uri = original.remember([image])[0]["uri"]!
+    var bookmark: String?
+    request(original, "bookmarkRecent", ["uri": uri]) { bookmark = $0 as? String }
+    let saved = try XCTUnwrap(bookmark)
+    let restored = DocumentStorage()
+    request(restored, "restoreRecent", ["uri": uri, "bookmark": saved]) { value in
+      XCTAssertEqual((value as? [String: String])?["uri"], uri)
+    }
+    var handle: Int?
+    request(restored, "openDescriptor", ["uri": uri, "write": false]) { value in
+      let descriptor = value as? [String: Int]
+      handle = descriptor?["handle"]
+      if let fd = descriptor?["fd"] { XCTAssertEqual(fcntl(Int32(fd), F_GETFL) & O_ACCMODE, O_RDONLY) }
+    }
+    request(restored, "closeDescriptor", ["handle": try XCTUnwrap(handle)]) { XCTAssertNil($0) }
+    request(DocumentStorage(), "restoreRecent", ["uri": uri, "bookmark": "invalid"]) { XCTAssertTrue($0 is FlutterError) }
+    let exported = original.remember([folder], exportName: "export.vhdx")[0]["uri"]!
+    request(original, "bookmarkRecent", ["uri": exported]) { XCTAssertTrue($0 is FlutterError) }
+  }
+
   func testReadOnlyLeasesRemainIndependent() throws {
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

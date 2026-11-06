@@ -18,6 +18,7 @@ import 'reader_navigation.dart';
 import 'screen_layout.dart';
 import 'cache_settings.dart';
 import 'thumbnails.dart';
+import 'recent_images.dart';
 
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -26,10 +27,13 @@ Future<void> main(List<String> args) async {
     SystemChrome.setSystemUIOverlayStyle(readerSystemStyle);
   }
   final cacheSettings = await const CacheSettingsStore().load();
+  final recents = RecentImagesStore();
+  await recents.load();
   runApp(
     _Bootstrap(
       initialImage: args.isEmpty ? null : args.first,
       cacheSettings: cacheSettings,
+      recents: recents,
     ),
   );
 }
@@ -63,7 +67,12 @@ ThemeData readerTheme() => ThemeData(
 );
 
 class _Bootstrap extends StatefulWidget {
-  const _Bootstrap({this.initialImage, required this.cacheSettings});
+  const _Bootstrap({
+    this.initialImage,
+    required this.cacheSettings,
+    required this.recents,
+  });
+  final RecentImagesStore recents;
   final String? initialImage;
   final CacheSettings cacheSettings;
   @override
@@ -81,6 +90,7 @@ class _BootstrapState extends State<_Bootstrap> {
           backend: snapshot.data!,
           initialImage: widget.initialImage,
           cacheSettings: widget.cacheSettings,
+          recents: widget.recents,
         );
       }
       return MaterialApp(
@@ -121,7 +131,9 @@ class ReaderApp extends StatelessWidget {
     this.platform,
     this.cacheSettings = const CacheSettings(),
     this.saveCacheSettings,
+    this.recents,
   });
+  final RecentImagesStore? recents;
   final CacheSettings cacheSettings;
   final Future<void> Function(CacheSettings)? saveCacheSettings;
   final TargetPlatform? platform;
@@ -145,6 +157,7 @@ class ReaderApp extends StatelessWidget {
       platform: platform ?? readerTheme().platform,
       cacheSettings: cacheSettings,
       saveCacheSettings: saveCacheSettings ?? const CacheSettingsStore().save,
+      recents: recents,
     ),
   );
 }
@@ -167,9 +180,11 @@ class _ReaderWorkspace extends StatefulWidget {
     required this.platform,
     required this.cacheSettings,
     required this.saveCacheSettings,
+    this.recents,
   });
   final CacheSettings cacheSettings;
   final Future<void> Function(CacheSettings) saveCacheSettings;
+  final RecentImagesStore? recents;
   final TargetPlatform platform;
   final ReaderBackend backend;
   final String? initialImage;
@@ -187,6 +202,33 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
   int _active = 0;
   int _nextId = 1;
   bool _opening = false;
+  Future<void> _openTail = Future.value();
+  late final _recents = widget.recents ?? RecentImagesStore.memory();
+  void _recentsChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _rememberRecent(String path) async {
+    if (!mounted) return;
+    try {
+      await _recents.record(path, PlatformStorage.displayName(path));
+      final bookmark = await PlatformStorage.bookmarkRecent(path);
+      if (mounted && bookmark != null) {
+        await _recents.attachBookmark(path, bookmark);
+      }
+    } catch (_) {
+      /* History/bookmark failures do not invalidate an open image. */
+    }
+  }
+
+  void _removeRecent(RecentImage item) {
+    unawaited(_recents.remove(item.path).catchError((Object _) {}));
+  }
+
+  void _clearRecents() {
+    unawaited(_recents.clear().catchError((Object _) {}));
+  }
+
   bool _settingsOpen = false;
   bool _windowVisible = true;
   bool _foreground = true;
@@ -213,6 +255,14 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
   Future<dynamic> _windowEvent(MethodCall call) async {
     if (!mounted) return;
     switch (call.method) {
+      case 'openImages':
+        final paths =
+            (call.arguments as List?)
+                ?.whereType<String>()
+                .where((p) => p.toLowerCase().endsWith('.vhdx'))
+                .toList() ??
+            <String>[];
+        if (paths.isNotEmpty) await _enqueueOpen(() => _addPaths(paths));
       case 'hidden':
         setState(() => _windowVisible = false);
       case 'shown':
@@ -335,6 +385,10 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
   void initState() {
     super.initState();
     setDesktopWindowHandler(_windowEvent);
+    _recents.addListener(_recentsChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(windowAction('ready'));
+    });
     WidgetsBinding.instance.addObserver(this);
     if (widget.platform == TargetPlatform.android ||
         widget.platform == TargetPlatform.iOS) {
@@ -400,55 +454,93 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
     }
   }
 
-  String _identity(String path) {
-    if (PlatformStorage.isDocument(path)) return path;
-    final absolute = File(path).absolute.uri.normalizePath().toFilePath();
-    return Platform.isWindows ? absolute.toLowerCase() : absolute;
+  Future<void> _enqueueOpen(Future<void> Function() action) {
+    final operation = _openTail.then((_) async {
+      if (!mounted || _quitting) return;
+      setState(() => _opening = true);
+      try {
+        await action();
+      } catch (_) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text('无法加载镜像，请确认设备已连接，或重新选择文件授权。'),
+              action: SnackBarAction(
+                label: '重新选择',
+                onPressed: () => unawaited(_openImages()),
+              ),
+            ),
+          );
+        }
+      } finally {
+        if (mounted) setState(() => _opening = false);
+      }
+    });
+    _openTail = operation;
+    return operation;
   }
 
-  Future<void> _openImages() async {
-    if (_opening) return;
-    setState(() => _opening = true);
-    try {
+  Future<void> _openImages() {
+    if (_opening) return Future.value();
+    return _enqueueOpen(() async {
       final paths = widget.pickImages != null
           ? await widget.pickImages!()
           : await PlatformStorage.chooseImages();
-      for (final path in paths) {
-        if (!mounted) break;
-        final existing = _tabs.indexWhere(
-          (tab) => tab.path != null && _identity(tab.path!) == _identity(path),
-        );
-        if (existing >= 0) {
-          setState(() => _active = existing);
-          continue;
-        }
-        final empty = _tabs.indexWhere((tab) => tab.path == null);
-        final backend = empty >= 0
-            ? _tabs[empty].backend
-            : await widget.createBackend();
-        if (!mounted) {
-          if (empty < 0) await backend.dispose();
-          break;
-        }
+      await _addPaths(paths);
+    });
+  }
+
+  Future<void> _openRecent(RecentImage item) => _enqueueOpen(() async {
+    final existing = _tabs.any(
+      (tab) =>
+          tab.path != null &&
+          imageIdentity(tab.path!) == imageIdentity(item.path),
+    );
+    final path = existing
+        ? item.path
+        : await PlatformStorage.restoreRecent(item.path, item.bookmark);
+    await _addPaths([path]);
+  });
+
+  Future<void> _addPaths(List<String> paths) async {
+    for (final path in paths) {
+      if (!mounted) break;
+      final existing = _tabs.indexWhere(
+        (tab) =>
+            tab.path != null && imageIdentity(tab.path!) == imageIdentity(path),
+      );
+      if (existing >= 0) {
         setState(() {
-          final tab = _ImageTab(_nextId++, backend, path);
-          if (empty >= 0) {
-            _tabs[empty] = tab;
-            _active = empty;
-          } else {
-            _tabs.add(tab);
-            _active = _tabs.length - 1;
-          }
+          _active = existing;
+          _settingsOpen = false;
         });
+        final home = _tabs[existing].home.currentState;
+        if (home != null && home._image == null && !home._busy) {
+          await home._open(path);
+        } else if (home?._image != null) {
+          unawaited(_rememberRecent(path));
+        }
+        continue;
       }
-    } catch (_) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('无法打开镜像选择器或创建读取会话，请重试。')));
+      final empty = _tabs.indexWhere((tab) => tab.path == null);
+      final backend = empty >= 0
+          ? _tabs[empty].backend
+          : await widget.createBackend();
+      if (!mounted) {
+        if (empty < 0) await backend.dispose();
+        break;
       }
-    } finally {
-      if (mounted) setState(() => _opening = false);
+      setState(() {
+        _settingsOpen = false;
+        final tab = _ImageTab(_nextId++, backend, path);
+        if (empty >= 0) {
+          _tabs[empty] = tab;
+          _active = empty;
+        } else {
+          _tabs.add(tab);
+          _active = _tabs.length - 1;
+        }
+      });
     }
   }
 
@@ -487,6 +579,8 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
   @override
   void dispose() {
     setDesktopWindowHandler(null);
+    _recents.removeListener(_recentsChanged);
+    if (widget.recents == null) _recents.dispose();
     WidgetsBinding.instance.removeObserver(this);
     _thumbnails.dispose();
     for (final tab in _tabs) {
@@ -515,6 +609,11 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
           platform: widget.platform,
           cacheSettings: _cacheSettings,
           thumbnails: _thumbnails,
+          recents: _recents.items,
+          onRecent: _opening ? null : (item) => unawaited(_openRecent(item)),
+          onRemoveRecent: _removeRecent,
+          onClearRecents: _clearRecents,
+          onImageOpened: (path) => unawaited(_rememberRecent(path)),
           initialImage: tab.path,
           active:
               tab == _tabs[_active] &&
@@ -621,8 +720,18 @@ class ReaderHome extends StatefulWidget {
     this.onShowSystem,
     this.cacheSettings = const CacheSettings(),
     this.thumbnails,
+    this.recents = const [],
+    this.onRecent,
+    this.onRemoveRecent,
+    this.onClearRecents,
+    this.onImageOpened,
   });
   final ThumbnailCache? thumbnails;
+  final List<RecentImage> recents;
+  final ValueChanged<RecentImage>? onRecent;
+  final ValueChanged<RecentImage>? onRemoveRecent;
+  final VoidCallback? onClearRecents;
+  final ValueChanged<String>? onImageOpened;
   final CacheSettings cacheSettings;
   final TargetPlatform platform;
   final ReaderBackend backend;
@@ -816,6 +925,7 @@ class _ReaderHomeState extends State<ReaderHome> {
       _image = image;
       _imagePath = path;
     });
+    widget.onImageOpened?.call(path);
     final supported = _partitions
         .where((p) => p['kind'] == 'Ntfs' || p['kind'] == 'BitLocker')
         .toList();
@@ -1233,6 +1343,18 @@ class _ReaderHomeState extends State<ReaderHome> {
             '支持普通卷和 BitLocker 加密卷',
             style: TextStyle(fontSize: 12, color: Color(0xff94a3b8)),
           ),
+          if (widget.recents.isNotEmpty) ...[
+            const SizedBox(height: 20),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: RecentImagesList(
+                items: widget.recents.take(5).toList(),
+                onOpen: widget.onRecent,
+                onRemove: widget.onRemoveRecent,
+                onClear: widget.onClearRecents,
+              ),
+            ),
+          ],
         ],
       ),
     ),
@@ -1616,6 +1738,15 @@ class _ReaderHomeState extends State<ReaderHome> {
       _shell.currentState?.closeDrawer();
       widget.onSettings?.call();
     },
+    recents: widget.recents,
+    onRecent: widget.onRecent == null
+        ? null
+        : (item) {
+            _shell.currentState?.closeDrawer();
+            widget.onRecent!(item);
+          },
+    onRemoveRecent: widget.onRemoveRecent,
+    onClearRecents: widget.onClearRecents,
     actions: [
       if (_image != null) ...[
         if (_partitions.length > 1)

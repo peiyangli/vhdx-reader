@@ -15,6 +15,24 @@ class PlatformStorage {
     return isDocument(path) ? Uri.decodeComponent(name) : name;
   }
 
+  static void rememberName(String path, String name) => _names[path] = name;
+
+  static Future<String?> bookmarkRecent(String path) async {
+    if (!Platform.isIOS && !Platform.isMacOS) return null;
+    return channel.invokeMethod<String>('bookmarkRecent', {'uri': path});
+  }
+
+  static Future<String> restoreRecent(String path, String? bookmark) async {
+    if (!Platform.isIOS && !Platform.isMacOS) return path;
+    final item = await channel.invokeMapMethod<String, dynamic>(
+      'restoreRecent',
+      {'uri': path, 'bookmark': ?bookmark},
+    );
+    final restored = item!['uri'] as String;
+    rememberName(restored, item['name'] as String);
+    return restored;
+  }
+
   static Future<bool> beginPlayback() async =>
       (await channel.invokeMethod<bool>('beginPlayback'))!;
   static Future<void> endPlayback() => channel.invokeMethod('endPlayback');

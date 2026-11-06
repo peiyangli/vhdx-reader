@@ -1,5 +1,7 @@
 #include "flutter_window.h"
 #include "vault_authentication.h"
+#include "single_instance.h"
+#include <cstring>
 
 #include <optional>
 #include <shellapi.h>
@@ -44,7 +46,11 @@ bool FlutterWindow::OnCreate() {
   window_channel_->SetMethodCallHandler(
       [this, hwnd](const auto& call, auto result) {
         const auto& action = call.method_name();
-        if (action == "drag") {
+        if (action == "ready") {
+          dart_ready_ = true;
+          result->Success();
+          FlushLaunchPaths();
+        } else if (action == "drag") {
           result->Success();
           ReleaseCapture();
           POINT cursor{};
@@ -69,6 +75,7 @@ bool FlutterWindow::OnCreate() {
         }
       });
 
+  SetPropW(hwnd, single_instance::kWindowProperty, reinterpret_cast<HANDLE>(1));
   AddTray();
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -84,6 +91,7 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  RemovePropW(GetHandle(), single_instance::kWindowProperty);
   NOTIFYICONDATAW icon{};
   icon.cbSize = sizeof(icon); icon.hWnd = GetHandle(); icon.uID = 1;
   Shell_NotifyIconW(NIM_DELETE, &icon);
@@ -100,6 +108,27 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (message == WM_COPYDATA) {
+    const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lparam);
+    if (!data || data->dwData != single_instance::kCopyData || !data->lpData ||
+        data->cbData == 0 || data->cbData > 65536) return FALSE;
+    const auto* bytes = static_cast<const char*>(data->lpData);
+    if (bytes[data->cbData - 1] != '\0') return FALSE;
+    std::vector<std::string> paths;
+    size_t offset = 0;
+    while (offset < data->cbData) {
+      const auto length = strnlen(bytes + offset, data->cbData - offset);
+      if (length) {
+        if (paths.size() >= 64 || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+              bytes + offset, static_cast<int>(length), nullptr, 0)) return FALSE;
+        paths.emplace_back(bytes + offset, length);
+      }
+      offset += length + 1;
+    }
+    Restore();
+    QueueLaunchPaths(paths);
+    return TRUE;
+  }
   static const UINT taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
   if (message == taskbar_created) { AddTray(); return 0; }
   if (message == WM_APP + 90) {
@@ -180,4 +209,17 @@ void FlutterWindow::AddTray() {
     icon.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &icon);
   } else if (hidden_) { Restore(); }
+}
+
+void FlutterWindow::QueueLaunchPaths(const std::vector<std::string>& paths) {
+  launch_paths_.insert(launch_paths_.end(), paths.begin(), paths.end());
+  FlushLaunchPaths();
+}
+
+void FlutterWindow::FlushLaunchPaths() {
+  if (!dart_ready_ || !window_channel_ || launch_paths_.empty()) return;
+  flutter::EncodableList paths;
+  for (const auto& path : launch_paths_) paths.emplace_back(path);
+  launch_paths_.clear();
+  window_channel_->InvokeMethod("openImages", std::make_unique<flutter::EncodableValue>(paths));
 }

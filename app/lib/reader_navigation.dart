@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'platform_storage.dart';
+import 'recent_images.dart';
 import 'window_chrome.dart';
 import 'screen_layout.dart';
 import 'cache_settings.dart';
@@ -14,6 +15,10 @@ class DiskDrawer extends StatelessWidget {
     required this.onAdd,
     required this.onSettings,
     required this.actions,
+    this.recents = const [],
+    this.onRecent,
+    this.onRemoveRecent,
+    this.onClearRecents,
   });
   final Map<int, String> images;
   final int? activeImageId;
@@ -21,6 +26,10 @@ class DiskDrawer extends StatelessWidget {
   final VoidCallback? onAdd;
   final VoidCallback onSettings;
   final List<Widget> actions;
+  final List<RecentImage> recents;
+  final ValueChanged<RecentImage>? onRecent;
+  final ValueChanged<RecentImage>? onRemoveRecent;
+  final VoidCallback? onClearRecents;
 
   @override
   Widget build(BuildContext context) => Drawer(
@@ -99,6 +108,15 @@ class DiskDrawer extends StatelessWidget {
                   ),
                   ...actions,
                 ],
+                if (recents.isNotEmpty) ...[
+                  const Divider(height: 24),
+                  RecentImagesList(
+                    items: recents,
+                    onOpen: onRecent,
+                    onRemove: onRemoveRecent,
+                    onClear: onClearRecents,
+                  ),
+                ],
                 const SizedBox(height: 12),
               ],
             ),
@@ -117,6 +135,65 @@ class DiskDrawer extends StatelessWidget {
         ],
       ),
     ),
+  );
+}
+
+class RecentImagesList extends StatelessWidget {
+  const RecentImagesList({
+    super.key,
+    required this.items,
+    this.onOpen,
+    this.onRemove,
+    this.onClear,
+  });
+  final List<RecentImage> items;
+  final ValueChanged<RecentImage>? onOpen;
+  final ValueChanged<RecentImage>? onRemove;
+  final VoidCallback? onClear;
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      Row(
+        children: [
+          const Expanded(
+            child: Padding(
+              padding: EdgeInsets.only(left: 12),
+              child: Text(
+                '最近打开',
+                style: TextStyle(fontSize: 13, color: Color(0xff718098)),
+              ),
+            ),
+          ),
+          TextButton(
+            key: const Key('clear-recents'),
+            onPressed: onClear,
+            child: const Text('清空记录'),
+          ),
+        ],
+      ),
+      for (final item in items)
+        ListTile(
+          key: ValueKey('recent-image-${item.path}'),
+          leading: const Icon(Icons.history),
+          title: Text(item.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: PlatformStorage.isDocument(item.path)
+              ? null
+              : Text(
+                  item.path,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11),
+                ),
+          enabled: onOpen != null,
+          onTap: onOpen == null ? null : () => onOpen!(item),
+          trailing: IconButton(
+            tooltip: '移除记录',
+            onPressed: onRemove == null ? null : () => onRemove!(item),
+            icon: const Icon(Icons.close, size: 18),
+          ),
+        ),
+    ],
   );
 }
 

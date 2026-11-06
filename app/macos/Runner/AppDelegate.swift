@@ -72,6 +72,61 @@ func installVaultAuthentication() {
 
 @main
 class AppDelegate: FlutterAppDelegate {
+  private var instanceLock: Int32 = -1
+  private var duplicateInstance = false
+  private var reopenObserver: NSObjectProtocol?
+#if DEBUG
+  private let reopenName = Notification.Name("org.vhdxreader.reopen.debug")
+#else
+  private let reopenName = Notification.Name("org.vhdxreader.reopen")
+#endif
+  override func applicationWillFinishLaunching(_ notification: Notification) {
+    // Register before taking the lock so a concurrent launch cannot lose its
+    // wake-up notification while the primary is still constructing its window.
+    reopenObserver = DistributedNotificationCenter.default().addObserver(forName: reopenName, object: nil, queue: .main) { [weak self] _ in
+      guard let self = self, !self.duplicateInstance else { return }
+      DispatchQueue.main.async { (self.mainFlutterWindow as? MainFlutterWindow)?.restoreFromTray() }
+    }
+    do {
+      let root = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+      let directory = root.appendingPathComponent("VHDXReader", isDirectory: true)
+      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+#if DEBUG
+      let lockURL = directory.appendingPathComponent("instance-debug.lock")
+#else
+      let lockURL = directory.appendingPathComponent("instance.lock")
+#endif
+      instanceLock = Darwin.open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC, mode_t(0o600))
+      guard instanceLock >= 0 else { throw CocoaError(.fileWriteNoPermission) }
+      if flock(instanceLock, LOCK_EX | LOCK_NB) != 0 {
+        duplicateInstance = true
+        DistributedNotificationCenter.default().postNotificationName(reopenName, object: nil, userInfo: nil, deliverImmediately: true)
+        NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+          .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+          .first?.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        NSApp.terminate(nil)
+        return
+      }
+    } catch {
+      duplicateInstance = true
+      let alert = NSAlert(); alert.messageText = "无法初始化应用运行状态，请稍后重试。"; alert.runModal()
+      NSApp.terminate(nil)
+      return
+    }
+    super.applicationWillFinishLaunching(notification)
+  }
+
+  override func application(_ sender: NSApplication, openFiles filenames: [String]) {
+    (mainFlutterWindow as? MainFlutterWindow)?.openImages(filenames)
+    sender.reply(toOpenOrPrint: .success)
+  }
+
+  override func applicationWillTerminate(_ notification: Notification) {
+    if let observer = reopenObserver { DistributedNotificationCenter.default().removeObserver(observer) }
+    if instanceLock >= 0 { Darwin.close(instanceLock); instanceLock = -1 }
+    super.applicationWillTerminate(notification)
+  }
+
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
     return false
   }
@@ -82,7 +137,7 @@ class AppDelegate: FlutterAppDelegate {
   }
 
   override func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-    guard let window = mainFlutterWindow as? MainFlutterWindow, !window.quitting else { return .terminateNow }
+    guard !duplicateInstance, let window = mainFlutterWindow as? MainFlutterWindow, !window.quitting else { return .terminateNow }
     window.terminationPending = true
     window.restoreFromTray()
     window.notify("requestQuit")

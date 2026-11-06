@@ -106,6 +106,32 @@ final class DocumentStorage: NSObject, FlutterPlugin, UIDocumentPickerDelegate {
         fail(result, "presentation", "请先关闭当前弹窗，再选择文件。"); return
       }
       host.present(picker, animated: true)
+    case "bookmarkRecent":
+      guard let uri = args["uri"] as? String, let document = documents[uri], !document.writable else {
+        fail(result, "document", "无法保存文件授权，请重新选择镜像。"); return
+      }
+      let scoped = document.scope.startAccessingSecurityScopedResource()
+      defer { if scoped { document.scope.stopAccessingSecurityScopedResource() } }
+      do {
+        let data = try document.url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil)
+        result(data.base64EncodedString())
+      } catch { fail(result, "bookmark", "该文件提供方暂不支持保存访问授权。") }
+    case "restoreRecent":
+      guard let uri = args["uri"] as? String, uri.hasPrefix("vhdx-document://") else {
+        fail(result, "document", "无效的最近记录。"); return
+      }
+      if let document = documents[uri], !document.writable {
+        result(["uri": uri, "name": document.url.lastPathComponent]); return
+      }
+      guard let encoded = args["bookmark"] as? String, let data = Data(base64Encoded: encoded) else {
+        fail(result, "document", "文件授权已失效，请重新选择镜像。"); return
+      }
+      do {
+        var stale = false
+        let url = try URL(resolvingBookmarkData: data, options: .withoutUI, relativeTo: nil, bookmarkDataIsStale: &stale)
+        documents[uri] = Document(url: url, scope: url, writable: false)
+        result(["uri": uri, "name": url.lastPathComponent])
+      } catch { fail(result, "document", "无法恢复文件授权，请连接存储设备或重新选择镜像。"); }
     case "openDescriptor":
       guard let uri = args["uri"] as? String, let document = documents[uri] else {
         fail(result, "document", "文件授权已失效，请重新选择文件。"); return
