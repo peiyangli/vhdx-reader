@@ -316,6 +316,10 @@ void main() {
       await tester.sendKeyEvent(LogicalKeyboardKey.space);
       expect(plays, 1);
       expect(mutes, 0);
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyM);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      expect(mutes, 1);
       final sliderFocus = find
           .descendant(
             of: find.byType(Slider),

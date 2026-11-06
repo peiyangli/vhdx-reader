@@ -59,6 +59,13 @@ class _PlaybackControlsState extends State<PlaybackControls> {
     const SingleActivator(LogicalKeyboardKey.escape): widget.onExit,
     const SingleActivator(LogicalKeyboardKey.arrowLeft): () => _skip(-1),
     const SingleActivator(LogicalKeyboardKey.arrowRight): () => _skip(1),
+    const SingleActivator(
+      LogicalKeyboardKey.keyM,
+      control: true,
+      includeRepeats: false,
+    ): () {
+      if (widget.enabled && !widget.pulling) widget.onMute?.call();
+    },
     const SingleActivator(LogicalKeyboardKey.keyM, includeRepeats: false): () {
       if (widget.enabled && !widget.pulling) widget.onMute?.call();
     },

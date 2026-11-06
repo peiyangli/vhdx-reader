@@ -434,7 +434,7 @@ class ReaderSettingsPage extends StatelessWidget {
                       padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
                       child: Text(
                         '视频快捷键：空格 播放 / 暂停；← / → 快退 / 快进；\n'
-                        'Shift + ← / → 上一个 / 下一个；M 静音；Esc 返回列表。',
+                        'Shift + ← / → 上一个 / 下一个；Ctrl + M 静音；Esc 返回列表。',
                       ),
                     ),
                     const Divider(),
