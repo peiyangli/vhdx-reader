@@ -241,7 +241,7 @@ void main() {
       expect(ends, 2);
     },
   );
-  testWidgets('desktop mouse hold and arrows retain the compact controls', (
+  testWidgets('desktop mouse hold and page keys retain the compact controls', (
     tester,
   ) async {
     var starts = 0, ends = 0, next = 0, previous = 0;
@@ -261,10 +261,8 @@ void main() {
     await mouse.up();
     await tester.pumpAndSettle();
     expect(ends, 1);
-    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
-    await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
-    await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
-    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+    await tester.sendKeyEvent(LogicalKeyboardKey.pageUp);
+    await tester.sendKeyEvent(LogicalKeyboardKey.pageDown);
     expect([previous, next], [1, 1]);
   });
   testWidgets(

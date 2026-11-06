@@ -70,15 +70,13 @@ class _PlaybackControlsState extends State<PlaybackControls> {
       if (widget.enabled && !widget.pulling) widget.onMute?.call();
     },
     const SingleActivator(
-      LogicalKeyboardKey.arrowLeft,
-      shift: true,
+      LogicalKeyboardKey.pageUp,
       includeRepeats: false,
     ): () {
       if (widget.enabled && !widget.pulling) widget.onPrevious?.call();
     },
     const SingleActivator(
-      LogicalKeyboardKey.arrowRight,
-      shift: true,
+      LogicalKeyboardKey.pageDown,
       includeRepeats: false,
     ): () {
       if (widget.enabled && !widget.pulling) widget.onNext?.call();
