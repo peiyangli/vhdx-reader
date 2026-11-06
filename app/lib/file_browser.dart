@@ -1,6 +1,7 @@
 import 'dart:ui' show PointerDeviceKind;
 import 'package:flutter/material.dart';
 import 'preview.dart';
+import 'thumbnails.dart';
 import 'screen_layout.dart';
 
 enum FileSort { name, size, modified, type }
@@ -27,9 +28,9 @@ List<Map<String, dynamic>> sortedFiles(
       if (sort == FileSort.size) {
         result = (a['size'] as int).compareTo(b['size'] as int);
       } else if (sort == FileSort.type) {
-        result = fileType(
+        result = friendlyTypeOrder(
           a['name'] as String,
-        ).compareTo(fileType(b['name'] as String));
+        ).compareTo(friendlyTypeOrder(b['name'] as String));
       }
     }
     if (result == 0) {
@@ -95,6 +96,8 @@ class FileContents extends StatelessWidget {
     required this.onOpen,
     required this.storageKey,
     this.selected,
+    this.thumbnailScope,
+    this.directory = '/',
   });
   final List<Map<String, dynamic>> entries;
   final bool grid;
@@ -104,6 +107,15 @@ class FileContents extends StatelessWidget {
   final ValueChanged<Map<String, dynamic>>? onOpen;
   final String storageKey;
   final String? selected;
+  final ThumbnailScope? thumbnailScope;
+  final String directory;
+  Widget _thumbnail(Map<String, dynamic> file, Size size) => FileThumbnail(
+    key: ValueKey('thumb-${file['name']}'),
+    entry: file,
+    scope: thumbnailScope,
+    path: directory == '/' ? "/${file['name']}" : "$directory/${file['name']}",
+    size: size,
+  );
 
   @override
   Widget build(BuildContext context) => LayoutBuilder(
@@ -161,7 +173,7 @@ class FileContents extends StatelessWidget {
         gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
           maxCrossAxisExtent: 160,
           mainAxisExtent:
-              (compact ? 112 : 142) + (layout.textScale - 1).clamp(0, 2) * 40,
+              (compact ? 124 : 162) + (layout.textScale - 1).clamp(0, 2) * 40,
           crossAxisSpacing: 8,
           mainAxisSpacing: 8,
         ),
@@ -169,7 +181,6 @@ class FileContents extends StatelessWidget {
         itemBuilder: (context, i) {
           final file = files[i];
           final name = file['name'] as String;
-          final folder = file['directory'] == true;
           return _item(
             file,
             Tooltip(
@@ -179,13 +190,7 @@ class FileContents extends StatelessWidget {
                 child: Column(
                   children: [
                     SizedBox(height: compact ? 0 : 8),
-                    Icon(
-                      fileIcon(name, folder),
-                      size: compact ? 32 : 46,
-                      color: folder
-                          ? const Color(0xffd5a340)
-                          : const Color(0xff7189ae),
-                    ),
+                    _thumbnail(file, Size(128, compact ? 48 : 70)),
                     SizedBox(height: compact ? 6 : 12),
                     Text(
                       name,
@@ -218,13 +223,7 @@ class FileContents extends StatelessWidget {
               padding: const EdgeInsets.symmetric(horizontal: 12),
               child: Row(
                 children: [
-                  Icon(
-                    fileIcon(name, folder),
-                    size: 26,
-                    color: folder
-                        ? const Color(0xffd5a340)
-                        : const Color(0xff7189ae),
-                  ),
+                  _thumbnail(file, const Size(44, 40)),
                   const SizedBox(width: 14),
                   Expanded(
                     child: Column(
@@ -243,7 +242,7 @@ class FileContents extends StatelessWidget {
                         if (!inline) const SizedBox(height: 4),
                         if (!inline)
                           Text(
-                            '${fileDate(file['modified_unix_ms'])}${folder ? '' : ' · ${formatBytes(file['size'] as int)}'}',
+                            '${folder ? '文件夹' : friendlyType(name)} · ${fileDate(file['modified_unix_ms'])}${folder ? '' : ' · ${formatBytes(file['size'] as int)}'}',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
@@ -258,7 +257,7 @@ class FileContents extends StatelessWidget {
                     Padding(
                       padding: const EdgeInsets.only(left: 16, right: 8),
                       child: Text(
-                        '${fileDate(file['modified_unix_ms'])}${folder ? '' : ' · ${formatBytes(file['size'] as int)}'}',
+                        '${folder ? '文件夹' : friendlyType(name)} · ${fileDate(file['modified_unix_ms'])}${folder ? '' : ' · ${formatBytes(file['size'] as int)}'}',
                         style: const TextStyle(
                           fontSize: 11,
                           color: Color(0xff8a929f),

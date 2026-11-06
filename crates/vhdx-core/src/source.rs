@@ -60,6 +60,43 @@ pub fn duplicate_file_descriptor(fd: i32) -> Result<File> {
     }
 }
 impl LocalFile {
+    /// Cache identity metadata comes from the opened file, including SAF/iOS
+    /// descriptors. Unknown timestamps must fall back to a per-open namespace.
+    pub fn cache_revision(&self) -> Option<String> {
+        let metadata = self.file.metadata().ok()?;
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        if modified == 0 {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(format!(
+                "{}:{}:{}:{}:{}:{}",
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+                modified,
+                metadata.ctime(),
+                metadata.ctime_nsec()
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let created = metadata
+                .created()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            Some(format!("{}:{}:{}", metadata.len(), modified, created))
+        }
+    }
     pub fn open(path: &Path) -> Result<Self> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
@@ -433,5 +470,34 @@ pub(crate) mod tests {
         drop(source);
         std::fs::remove_file(path).unwrap();
         assert!(duplicate_file_descriptor(-1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cache_revision_tests {
+    use super::LocalFile;
+    #[test]
+    fn revision_is_stable_for_reopen_and_changes_with_replacement() {
+        let path = std::env::temp_dir().join(format!(
+            "vhdx-revision-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"first").unwrap();
+        let first = LocalFile::open(&path).unwrap().cache_revision().unwrap();
+        assert_eq!(
+            LocalFile::open(&path).unwrap().cache_revision().unwrap(),
+            first
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"different image").unwrap();
+        assert_ne!(
+            LocalFile::open(&path).unwrap().cache_revision().unwrap(),
+            first
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

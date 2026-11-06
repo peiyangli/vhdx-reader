@@ -4,7 +4,26 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 class CacheSettings {
-  const CacheSettings({this.plaintextMiB = 16, this.ciphertextMiB = 1});
+  const CacheSettings({
+    this.plaintextMiB = 16,
+    this.ciphertextMiB = 1,
+    this.thumbnailDisk = true,
+    this.bitLockerThumbnailDisk = false,
+  });
+  final bool thumbnailDisk;
+  final bool bitLockerThumbnailDisk;
+  CacheSettings copyWith({
+    int? plaintextMiB,
+    int? ciphertextMiB,
+    bool? thumbnailDisk,
+    bool? bitLockerThumbnailDisk,
+  }) => CacheSettings(
+    plaintextMiB: plaintextMiB ?? this.plaintextMiB,
+    ciphertextMiB: ciphertextMiB ?? this.ciphertextMiB,
+    thumbnailDisk: thumbnailDisk ?? this.thumbnailDisk,
+    bitLockerThumbnailDisk:
+        bitLockerThumbnailDisk ?? this.bitLockerThumbnailDisk,
+  );
   static const plaintextOptions = [16, 32, 64, 128, 256];
   static const ciphertextOptions = [1, 2, 4, 8, 16];
   final int plaintextMiB;
@@ -13,7 +32,7 @@ class CacheSettings {
       plaintextOptions.contains(plaintextMiB) &&
       ciphertextOptions.contains(ciphertextMiB);
 
-  Map<String, int> toJson() => {
+  Map<String, dynamic> toJson() => {
     'plaintext_mib': plaintextMiB,
     'ciphertext_mib': ciphertextMiB,
   };
@@ -21,6 +40,8 @@ class CacheSettings {
   factory CacheSettings.fromJson(dynamic value) {
     if (value is! Map) return const CacheSettings();
     return CacheSettings(
+      thumbnailDisk: value['thumbnail_disk'] != false,
+      bitLockerThumbnailDisk: value['bitlocker_thumbnail_disk'] == true,
       plaintextMiB:
           value['plaintext_mib'] is int &&
               plaintextOptions.contains(value['plaintext_mib'])
@@ -35,7 +56,7 @@ class CacheSettings {
   }
 }
 
-/// Only numeric preferences are persisted, never image contents or credentials.
+/// Only preferences are persisted here, never image contents or credentials.
 class CacheSettingsStore {
   const CacheSettingsStore({this.directory});
   final Directory? directory;
@@ -77,7 +98,14 @@ class CacheSettingsStore {
     );
     try {
       await temporary.writeAsString(
-        jsonEncode({'version': 1, 'cache': value.toJson()}),
+        jsonEncode({
+          'version': 1,
+          'cache': {
+            ...value.toJson(),
+            'thumbnail_disk': value.thumbnailDisk,
+            'bitlocker_thumbnail_disk': value.bitLockerThumbnailDisk,
+          },
+        }),
         flush: true,
       );
       await temporary.rename(file.path);

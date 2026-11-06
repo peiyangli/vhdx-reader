@@ -17,6 +17,7 @@ import 'window_chrome.dart';
 import 'reader_navigation.dart';
 import 'screen_layout.dart';
 import 'cache_settings.dart';
+import 'thumbnails.dart';
 
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -154,6 +155,7 @@ class _ImageTab {
   final ReaderBackend backend;
   final String? path;
   bool busy = false;
+  final home = GlobalKey<_ReaderHomeState>();
 }
 
 class _ReaderWorkspace extends StatefulWidget {
@@ -177,7 +179,8 @@ class _ReaderWorkspace extends StatefulWidget {
   State<_ReaderWorkspace> createState() => _ReaderWorkspaceState();
 }
 
-class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
+class _ReaderWorkspaceState extends State<_ReaderWorkspace>
+    with WidgetsBindingObserver {
   late final List<_ImageTab> _tabs = [
     _ImageTab(0, widget.backend, widget.initialImage),
   ];
@@ -185,6 +188,105 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
   int _nextId = 1;
   bool _opening = false;
   bool _settingsOpen = false;
+  bool _windowVisible = true;
+  bool _foreground = true;
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (mounted) {
+      setState(() => _foreground = state == AppLifecycleState.resumed);
+    }
+  }
+
+  bool _quitting = false;
+  late final _thumbnails = ThumbnailCache(settings: widget.cacheSettings);
+
+  Future<dynamic> _windowEvent(MethodCall call) async {
+    if (!mounted) return;
+    switch (call.method) {
+      case 'hidden':
+        setState(() => _windowVisible = false);
+      case 'shown':
+        setState(() => _windowVisible = true);
+      case 'settings':
+        setState(() {
+          _settingsOpen = true;
+          _windowVisible = true;
+        });
+      case 'lockAll':
+        for (final tab in _tabs.toList()) {
+          final home = tab.home.currentState;
+          if (home == null || home._currentPartition?['kind'] != 'BitLocker') {
+            continue;
+          }
+          tab.backend.cancel();
+          for (var i = 0; tab.busy && i < 100; i++) {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+          }
+          if (home.mounted && !tab.busy) {
+            await home._lock();
+          } else if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('仍有磁盘操作未结束，部分卷尚未锁定，请稍后重试。')),
+            );
+          }
+        }
+      case 'requestQuit':
+        await _quit();
+    }
+  }
+
+  Future<void> _quit() async {
+    if (_quitting) return;
+    _quitting = true;
+    if (_opening || _tabs.any((tab) => tab.busy)) {
+      final quit = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('退出应用？'),
+          content: const Text('仍有操作正在进行，退出会取消未完成的读取或导出。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('继续使用'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('退出'),
+            ),
+          ],
+        ),
+      );
+      if (quit != true) {
+        _quitting = false;
+        await windowAction('cancelQuit');
+        return;
+      }
+    }
+    for (final tab in _tabs) {
+      tab.home.currentState?._clearFiles();
+      tab.backend.cancel();
+    }
+    await Future.wait(_tabs.map((tab) => tab.backend.dispose()));
+    await windowAction('quit');
+  }
+
+  Future<void> _clearThumbnails() async {
+    try {
+      await _thumbnails.clear();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('缩略图缓存已清空。')));
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('无法完全清空缩略图缓存，请重试。')));
+      }
+    }
+  }
+
   bool _showSystem = false;
   ScreenDirection _direction = ScreenDirection.automatic;
   bool _directionBusy = true;
@@ -198,13 +300,17 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
     if (_cacheSettingsBusy) return;
     setState(() => _cacheSettingsBusy = true);
     try {
+      await _thumbnails.configure(value);
       await widget.saveCacheSettings(value);
       if (!mounted) return;
       setState(() => _cacheSettings = value);
       ScaffoldMessenger.of(context)
         ..clearSnackBars()
-        ..showSnackBar(const SnackBar(content: Text('已保存，重新解锁或重新打开镜像后生效。')));
+        ..showSnackBar(
+          const SnackBar(content: Text('已保存。缩略图设置立即生效，读取缓存重新解锁或打开镜像后生效。')),
+        );
     } catch (_) {
+      await _thumbnails.configure(_cacheSettings);
       if (mounted) {
         ScaffoldMessenger.of(context)
           ..clearSnackBars()
@@ -218,6 +324,8 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
   @override
   void initState() {
     super.initState();
+    setDesktopWindowHandler(_windowEvent);
+    WidgetsBinding.instance.addObserver(this);
     if (widget.platform == TargetPlatform.android ||
         widget.platform == TargetPlatform.iOS) {
       unawaited(_loadDirection());
@@ -338,6 +446,7 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
     if (tab.busy || _opening) return;
     setState(() => tab.busy = true);
     tab.backend.beginOperation();
+    tab.home.currentState?._invalidateThumbnails();
     try {
       await tab.backend.request({'op': 'close'});
     } catch (_) {
@@ -367,6 +476,9 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
 
   @override
   void dispose() {
+    setDesktopWindowHandler(null);
+    WidgetsBinding.instance.removeObserver(this);
+    _thumbnails.dispose();
     for (final tab in _tabs) {
       unawaited(tab.backend.dispose());
     }
@@ -388,12 +500,17 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
     children: [
       for (final tab in _tabs)
         ReaderHome(
-          key: ValueKey(tab.id),
+          key: tab.home,
           backend: tab.backend,
           platform: widget.platform,
           cacheSettings: _cacheSettings,
+          thumbnails: _thumbnails,
           initialImage: tab.path,
-          active: tab == _tabs[_active] && !_settingsOpen,
+          active:
+              tab == _tabs[_active] &&
+              !_settingsOpen &&
+              _windowVisible &&
+              _foreground,
           onSettings: () => setState(() => _settingsOpen = true),
           showSystem: _showSystem,
           images: {
@@ -417,7 +534,14 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
     ],
   );
 
-  Widget _workspace() => PopScope(
+  Widget _workspace() => Column(
+    children: [
+      if (widget.platform == TargetPlatform.windows) const DesktopTitleBar(),
+      Expanded(child: _workspaceBody()),
+    ],
+  );
+
+  Widget _workspaceBody() => PopScope(
     canPop: !_settingsOpen,
     onPopInvokedWithResult: (didPop, result) {
       if (!didPop && _settingsOpen) {
@@ -437,7 +561,8 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace> {
                 key: const Key('reader-settings-page'),
                 cacheSettings: _cacheSettings,
                 onCacheSettings: _cacheSettingsBusy ? null : _setCacheSettings,
-                windowsChrome: widget.platform == TargetPlatform.windows,
+                onClearThumbnails: _clearThumbnails,
+                windowsChrome: false,
                 direction:
                     widget.platform == TargetPlatform.android ||
                         widget.platform == TargetPlatform.iOS
@@ -485,7 +610,9 @@ class ReaderHome extends StatefulWidget {
     this.onSettings,
     this.onShowSystem,
     this.cacheSettings = const CacheSettings(),
+    this.thumbnails,
   });
+  final ThumbnailCache? thumbnails;
   final CacheSettings cacheSettings;
   final TargetPlatform platform;
   final ReaderBackend backend;
@@ -546,6 +673,15 @@ class _ReaderHomeState extends State<ReaderHome> {
   Map<String, dynamic>? _selected;
   PreviewData? _preview;
   int _previewRevision = 0;
+  ThumbnailScope? _thumbnailScope;
+  String _sourceRevision = '';
+  void _syncThumbnails() =>
+      _thumbnailScope?.setActive(widget.active && !_busy && _preview == null);
+  void _invalidateThumbnails() {
+    _thumbnailScope?.invalidate();
+    _thumbnailScope = null;
+  }
+
   @override
   void initState() {
     super.initState();
@@ -560,6 +696,7 @@ class _ReaderHomeState extends State<ReaderHome> {
   @override
   void didUpdateWidget(covariant ReaderHome oldWidget) {
     super.didUpdateWidget(oldWidget);
+    _syncThumbnails();
     if (widget.active && !oldWidget.active) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _desktopFocus.requestFocus();
@@ -577,6 +714,7 @@ class _ReaderHomeState extends State<ReaderHome> {
 
   @override
   void dispose() {
+    _invalidateThumbnails();
     _preview?.dispose();
     _password.clear();
     _password.dispose();
@@ -598,6 +736,8 @@ class _ReaderHomeState extends State<ReaderHome> {
   String _leaf(String path) => PlatformStorage.displayName(path);
   String _join(String name) => _path == '/' ? '/$name' : '$_path/$name';
   void _clearFiles() {
+    _previewRevision++;
+    _invalidateThumbnails();
     _preview?.dispose();
     _unlocked = false;
     _entries = [];
@@ -615,6 +755,7 @@ class _ReaderHomeState extends State<ReaderHome> {
       _status = status;
       _error = null;
     });
+    _syncThumbnails();
     try {
       await operation();
     } on ReaderFailure catch (e) {
@@ -638,6 +779,7 @@ class _ReaderHomeState extends State<ReaderHome> {
           _busy = false;
           _status = '';
         });
+        _syncThumbnails();
       }
     }
   }
@@ -656,6 +798,9 @@ class _ReaderHomeState extends State<ReaderHome> {
       _credentialFile = null;
     });
     final image = await widget.backend.request({'op': 'open', 'path': path});
+    _sourceRevision =
+        image['source_revision'] as String? ??
+        '${DateTime.now().microsecondsSinceEpoch}';
     if (!mounted) return;
     setState(() {
       _image = image;
@@ -747,6 +892,7 @@ class _ReaderHomeState extends State<ReaderHome> {
 
   Future<void> _switchPartition(int index) => _run('正在切换分区…', () async {
     _shell.currentState?.closeDrawer();
+    _invalidateThumbnails();
     await widget.backend.request({'op': 'lock'});
     if (mounted) await _activate(index);
   });
@@ -794,6 +940,25 @@ class _ReaderHomeState extends State<ReaderHome> {
   }
 
   Future<void> _load(String path) async {
+    if (widget.thumbnails != null && _thumbnailScope == null) {
+      _thumbnailScope = ThumbnailScope(
+        widget.thumbnails!,
+        widget.backend,
+        jsonEncode([_imagePath, _sourceRevision, _partition]),
+        encrypted: _currentPartition?['kind'] == 'BitLocker',
+        onInvalidated: (error) {
+          if (!mounted) return;
+          setState(() {
+            _error = error.message;
+            _image = null;
+            _imagePath = null;
+            _partition = null;
+            _clearFiles();
+          });
+        },
+      );
+      _syncThumbnails();
+    }
     final entries = <Map<String, dynamic>>[];
     int? next = 0;
     do {
@@ -986,6 +1151,7 @@ class _ReaderHomeState extends State<ReaderHome> {
   Future<void> _lock() => _run('正在锁定…', () async {
     if (_partition != null) _manuallyLocked.add(_partition!);
     _shell.currentState?.closeDrawer();
+    _invalidateThumbnails();
     await widget.backend.request({'op': 'lock'});
     if (mounted) {
       setState(() {
@@ -1248,9 +1414,9 @@ class _ReaderHomeState extends State<ReaderHome> {
     _previewRevision++;
     _preview?.dispose();
     _preview = null;
+    _syncThumbnails();
   });
 
-  bool get _windowsChrome => widget.platform == TargetPlatform.windows;
   final _previewKey = GlobalKey();
   bool get _compact => ScreenLayout(context).compact;
 
@@ -1582,21 +1748,7 @@ class _ReaderHomeState extends State<ReaderHome> {
               onPressed: _busy ? null : _goBack,
               icon: const Icon(Icons.arrow_back, size: 20),
             ),
-          Expanded(
-            child: _windowsChrome
-                ? Row(
-                    children: [
-                      Flexible(
-                        child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 400),
-                          child: title,
-                        ),
-                      ),
-                      const Expanded(child: WindowDragArea()),
-                    ],
-                  )
-                : title,
-          ),
+          Expanded(child: title),
           if (_compact && _busy)
             IconButton(
               tooltip: '取消读取',
@@ -1612,7 +1764,6 @@ class _ReaderHomeState extends State<ReaderHome> {
             onPressed: _unlocked ? _showDisplayMenu : null,
             icon: const Icon(Icons.tune, size: 21),
           ),
-          if (_windowsChrome) const WindowButtons(),
         ],
       ),
     );
@@ -1805,6 +1956,8 @@ class _ReaderHomeState extends State<ReaderHome> {
       descending: _descending,
       selected: _selected?['name'] as String?,
       storageKey: '$_imagePath-$_partition-$_path',
+      thumbnailScope: _thumbnailScope,
+      directory: _path,
       onRefresh: _refresh,
       onOpen: _busy ? null : _select,
     );

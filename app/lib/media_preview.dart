@@ -54,6 +54,7 @@ class MediaPreviewSource extends ChangeNotifier {
   final VideoController controller;
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   bool _disposed = false;
+  Future<void> closed = Future.value();
   bool _visible = false;
   bool _firstVisibility = true;
   Duration position = Duration.zero;
@@ -66,38 +67,63 @@ class MediaPreviewSource extends ChangeNotifier {
 
   static Future<MediaPreviewSource> open(
     ReaderBackend backend,
-    String path,
-  ) async {
+    String path, {
+    bool thumbnail = false,
+  }) async {
     final media = await backend.request({'op': 'media_open', 'path': path});
     Player? player;
     MediaPreviewSource? source;
     var audioAcquired = false;
     try {
-      if (Platform.isIOS) {
+      if (Platform.isIOS && !thumbnail) {
         audioAcquired = await PlatformStorage.beginPlayback();
       }
       MediaKit.ensureInitialized();
       player = Player(
-        configuration: const PlayerConfiguration(
+        configuration: PlayerConfiguration(
           title: 'VHDX Reader',
           logLevel: MPVLogLevel.error,
-          bufferSize: 8 * 1024 * 1024,
+          bufferSize: (thumbnail ? 1 : 8) * 1024 * 1024,
           protocolWhitelist: ['http', 'tcp'],
         ),
       );
-      final controller = VideoController(player);
+      final controller = VideoController(
+        player,
+        configuration: thumbnail
+            ? VideoControllerConfiguration(
+                width: 320,
+                height: 180,
+                hwdec: Platform.isAndroid ? 'no' : null,
+              )
+            : const VideoControllerConfiguration(),
+      );
+      // Controller initialization is deferred to a frame. Lazy thumbnails can
+      // start while the browser is idle, so explicitly request that frame.
+      WidgetsBinding.instance.scheduleFrame();
       final native = player.platform;
       if (native is! NativePlayer) throw StateError('Native player required');
-      if (Platform.isIOS && !audioAcquired) {
+      if (thumbnail || (Platform.isIOS && !audioAcquired)) {
         await native.setProperty('ao', 'null');
       }
       // media_kit enables disk caching by default. Override BEFORE opening media.
+      if (thumbnail) {
+        await native.setProperty('pause', 'yes');
+        await native.setProperty('audio', 'no');
+        await native.setProperty('aid', 'no');
+      }
       await native.setProperty('cache-on-disk', 'no');
       if (await native.getProperty('cache-on-disk') != 'no') {
         throw StateError('Cannot disable media disk cache');
       }
-      await native.setProperty('demuxer-max-back-bytes', '${2 * 1024 * 1024}');
-      await native.setProperty('cache-secs', '5');
+      await native.setProperty(
+        'demuxer-max-back-bytes',
+        '${thumbnail ? 0 : 2 * 1024 * 1024}',
+      );
+      await native.setProperty('cache-secs', thumbnail ? '0' : '5');
+      if (thumbnail) {
+        await native.setProperty('cache', 'no');
+        await native.setProperty('demuxer-readahead-secs', '0');
+      }
       await native.setProperty('access-references', 'no');
       await native.setProperty('sub-auto', 'no');
       await native.setProperty('audio-file-auto', 'no');
@@ -132,7 +158,7 @@ class MediaPreviewSource extends ChangeNotifier {
       await player.add(Media(media['url'] as String));
       await native.setProperty('playlist-pos', '0');
       return source;
-    } catch (_) {
+    } catch (error) {
       if (source != null) {
         source.dispose();
       } else {
@@ -150,6 +176,7 @@ class MediaPreviewSource extends ChangeNotifier {
           await backend.request({'op': 'media_close', 'file': media['file']});
         } catch (_) {}
       }
+      if (error is ReaderFailure && error.invalidated) rethrow;
       throw ReaderFailure('media', '无法启动播放器，请完整解压程序并检查视频格式。');
     }
   }
@@ -278,17 +305,15 @@ class MediaPreviewSource extends ChangeNotifier {
           .request({'op': 'media_close', 'file': file})
           .then<void>((_) {}, onError: (Object _, StackTrace _) {}),
     );
-    unawaited(
-      _commands
-          .then((_) async {
-            try {
-              await _disposePlayer();
-            } finally {
-              if (_ownsPlaybackSession) await PlatformStorage.endPlayback();
-            }
-          })
-          .catchError((Object _) {}),
-    );
+    closed = _commands
+        .then((_) async {
+          try {
+            await _disposePlayer();
+          } finally {
+            if (_ownsPlaybackSession) await PlatformStorage.endPlayback();
+          }
+        })
+        .catchError((Object _) {});
     super.dispose();
   }
 }

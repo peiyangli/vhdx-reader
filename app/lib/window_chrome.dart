@@ -5,7 +5,7 @@ import 'package:flutter/services.dart';
 const _windowChannel = MethodChannel('vhdx_reader/window');
 
 Future<void> windowAction(String action) async {
-  if (!Platform.isWindows) return;
+  if (!Platform.isWindows && !Platform.isMacOS) return;
   try {
     await _windowChannel.invokeMethod<void>(action);
   } on MissingPluginException {
@@ -45,6 +45,36 @@ class WindowButtons extends StatelessWidget {
       ),
       onPressed: () => windowAction(action),
       icon: Icon(icon, size: 16),
+    ),
+  );
+}
+
+/// The native host explicitly reports hide/restore; desktop lifecycle events
+/// alone do not reliably describe a window kept alive in the tray.
+void setDesktopWindowHandler(Future<dynamic> Function(MethodCall)? handler) {
+  _windowChannel.setMethodCallHandler(handler);
+}
+
+class DesktopTitleBar extends StatelessWidget {
+  const DesktopTitleBar({super.key});
+  @override
+  Widget build(BuildContext context) => Material(
+    color: const Color(0xfff7f9fc),
+    child: SizedBox(
+      height: 44,
+      child: Row(
+        children: [
+          const SizedBox(width: 16),
+          const Icon(Icons.layers_rounded, size: 20, color: Color(0xff247cbe)),
+          const SizedBox(width: 9),
+          const Text(
+            'VHDX Reader',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+          const Expanded(child: WindowDragArea()),
+          const WindowButtons(),
+        ],
+      ),
     ),
   );
 }

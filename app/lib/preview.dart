@@ -6,7 +6,6 @@ import 'package:flutter/services.dart';
 import 'pdf_preview.dart';
 import 'media_preview.dart';
 import 'screen_layout.dart';
-import 'window_chrome.dart';
 
 String formatBytes(int bytes) {
   if (bytes < 1024) return '$bytes B';
@@ -181,12 +180,6 @@ class _PreviewPaneState extends State<PreviewPane> {
                     ),
                   ),
                 ),
-                if (Theme.of(context).platform == TargetPlatform.windows)
-                  const SizedBox(
-                    width: 72,
-                    height: 40,
-                    child: WindowDragArea(),
-                  ),
                 if (data?.bytes != null && isText(data!.name))
                   PopupMenuButton<String>(
                     tooltip: '文本编码',
@@ -217,7 +210,6 @@ class _PreviewPaneState extends State<PreviewPane> {
                     onPressed: widget.onBack,
                     icon: const Icon(Icons.close, size: 20),
                   ),
-                if (Theme.of(context).platform == TargetPlatform.windows) const WindowButtons(),
               ],
             ),
           ),

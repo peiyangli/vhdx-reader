@@ -118,31 +118,34 @@ void main() {
     ]);
   });
 
-  test('type uses case-insensitive extensions and names for folder order', () {
-    final files = [
-      entry('zeta.txt'),
-      entry('alpha.TXT'),
-      entry('report.pdf'),
-      entry('README'),
-      entry('folder.zzz', folder: true),
-    ];
-    expect(sortedFiles(files, FileSort.type, false).map((e) => e['name']), [
-      'folder.zzz',
-      'README',
-      'report.pdf',
-      'alpha.TXT',
-      'zeta.txt',
-    ]);
-    expect(sortedFiles(files, FileSort.type, true).map((e) => e['name']), [
-      'folder.zzz',
-      'zeta.txt',
-      'alpha.TXT',
-      'report.pdf',
-      'README',
-    ]);
-    expect(fileType('.env'), '');
-    expect(fileType('name.'), '');
-  });
+  test(
+    'type groups friendly categories and uses natural names within each category',
+    () {
+      final files = [
+        entry('zeta.txt'),
+        entry('alpha.TXT'),
+        entry('report.pdf'),
+        entry('README'),
+        entry('folder.zzz', folder: true),
+      ];
+      expect(sortedFiles(files, FileSort.type, false).map((e) => e['name']), [
+        'folder.zzz',
+        'report.pdf',
+        'alpha.TXT',
+        'zeta.txt',
+        'README',
+      ]);
+      expect(sortedFiles(files, FileSort.type, true).map((e) => e['name']), [
+        'folder.zzz',
+        'README',
+        'zeta.txt',
+        'alpha.TXT',
+        'report.pdf',
+      ]);
+      expect(fileType('.env'), '');
+      expect(fileType('name.'), '');
+    },
+  );
 
   for (final mode in ['empty', 'list', 'grid']) {
     testWidgets('pull refresh works for $mode contents', (tester) async {

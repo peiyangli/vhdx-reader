@@ -6,6 +6,7 @@
 namespace vault_authentication {
 void Install(HWND window);
 void Detach(HWND window);
+void CancelPending();
 bool HandleMessage(UINT message, WPARAM attempt);
 }
 #endif

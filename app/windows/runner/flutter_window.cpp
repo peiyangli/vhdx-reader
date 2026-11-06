@@ -2,6 +2,8 @@
 #include "vault_authentication.h"
 
 #include <optional>
+#include <shellapi.h>
+#include "resource.h"
 #include <flutter/standard_method_codec.h>
 
 #include "flutter/generated_plugin_registrant.h"
@@ -40,7 +42,7 @@ bool FlutterWindow::OnCreate() {
       flutter_controller_->engine()->messenger(), "vhdx_reader/window",
       &flutter::StandardMethodCodec::GetInstance());
   window_channel_->SetMethodCallHandler(
-      [hwnd](const auto& call, auto result) {
+      [this, hwnd](const auto& call, auto result) {
         const auto& action = call.method_name();
         if (action == "drag") {
           result->Success();
@@ -58,10 +60,16 @@ bool FlutterWindow::OnCreate() {
         } else if (action == "close") {
           result->Success();
           PostMessage(hwnd, WM_CLOSE, 0, 0);
+        } else if (action == "quit") {
+          quitting_ = true;
+          result->Success();
+          PostMessage(hwnd, WM_CLOSE, 0, 0);
         } else {
           result->NotImplemented();
         }
       });
+
+  AddTray();
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -76,6 +84,9 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  NOTIFYICONDATAW icon{};
+  icon.cbSize = sizeof(icon); icon.hWnd = GetHandle(); icon.uID = 1;
+  Shell_NotifyIconW(NIM_DELETE, &icon);
   vault_authentication::Detach(GetHandle());
   window_channel_ = nullptr;
   if (flutter_controller_) {
@@ -89,6 +100,40 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  static const UINT taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+  if (message == taskbar_created) { AddTray(); return 0; }
+  if (message == WM_APP + 90) {
+    const auto event = LOWORD(lparam);
+    if (event == NIN_SELECT || event == NIN_KEYSELECT || event == WM_LBUTTONDBLCLK) Restore();
+    if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP) {
+      HMENU menu = CreatePopupMenu();
+      AppendMenuW(menu, MF_STRING, 1, L"显示主窗口");
+      AppendMenuW(menu, MF_STRING, 2, L"锁定所有 BitLocker 卷");
+      AppendMenuW(menu, MF_STRING, 3, L"设置");
+      AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+      AppendMenuW(menu, MF_STRING, 4, L"退出应用");
+      POINT point{}; GetCursorPos(&point); SetForegroundWindow(hwnd);
+      const auto command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+          point.x, point.y, 0, hwnd, nullptr);
+      DestroyMenu(menu); PostMessage(hwnd, WM_NULL, 0, 0);
+      if (command) Restore();
+      if (command == 2) { vault_authentication::CancelPending(); Notify("lockAll"); }
+      if (command == 3) Notify("settings");
+      if (command == 4) Notify("requestQuit");
+    }
+    return 0;
+  }
+  if (message == WM_CLOSE && !quitting_) {
+    if (!tray_ready_) AddTray();
+    if (!tray_ready_) {
+      MessageBoxW(hwnd, L"无法创建托盘图标，请稍后重试。", L"VHDX Reader", MB_OK | MB_ICONWARNING);
+      return 0;
+    }
+    vault_authentication::CancelPending();
+    hidden_ = true; Notify("hidden"); ShowWindow(hwnd, SW_HIDE); return 0;
+  }
+  if (message == WM_QUERYENDSESSION) { quitting_ = true; return TRUE; }
+  if (message == WM_ENDSESSION && wparam) { quitting_ = true; DestroyWindow(hwnd); return 0; }
   if (vault_authentication::HandleMessage(message, wparam)) return 0;
 
   // Give Flutter, including plugins, an opportunity to handle window messages.
@@ -108,4 +153,31 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+}
+
+void FlutterWindow::Notify(const char* event) {
+  if (window_channel_) window_channel_->InvokeMethod(event, nullptr);
+}
+
+void FlutterWindow::Restore() {
+  ShowWindow(GetHandle(), IsIconic(GetHandle()) ? SW_RESTORE : SW_SHOW);
+  SetForegroundWindow(GetHandle());
+  hidden_ = false;
+  Notify("shown");
+}
+
+void FlutterWindow::AddTray() {
+  NOTIFYICONDATAW icon{};
+  icon.cbSize = sizeof(icon); icon.hWnd = GetHandle(); icon.uID = 1;
+  icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+  icon.uCallbackMessage = WM_APP + 90;
+  icon.hIcon = static_cast<HICON>(LoadImageW(GetModuleHandle(nullptr),
+      MAKEINTRESOURCE(IDI_TRAY_ICON), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+      GetSystemMetrics(SM_CYSMICON), LR_SHARED));
+  wcscpy_s(icon.szTip, L"VHDX Reader");
+  tray_ready_ = Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
+  if (tray_ready_) {
+    icon.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &icon);
+  } else if (hidden_) { Restore(); }
 }

@@ -140,6 +140,12 @@ void Install(HWND window) {
   install(Authenticate);
 }
 
+void CancelPending() {
+  std::shared_ptr<Attempt> attempt;
+  { std::lock_guard<std::mutex> guard(pending_mutex); attempt = std::move(pending); }
+  if (attempt) Cancel(attempt);
+}
+
 void Detach(HWND window) {
   if (host.load() != window) return;
   host.store(nullptr);

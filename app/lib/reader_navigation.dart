@@ -137,7 +137,9 @@ class ReaderSettingsPage extends StatelessWidget {
     required this.onBack,
     this.cacheSettings = const CacheSettings(),
     this.onCacheSettings,
+    this.onClearThumbnails,
   });
+  final Future<void> Function()? onClearThumbnails;
   final CacheSettings cacheSettings;
   final ValueChanged<CacheSettings>? onCacheSettings;
   final bool showShake;
@@ -205,7 +207,7 @@ class ReaderSettingsPage extends StatelessWidget {
         );
         if (selected != null && selected != current) {
           onCacheSettings?.call(
-            CacheSettings(
+            cacheSettings.copyWith(
               plaintextMiB: plaintext ? selected : cacheSettings.plaintextMiB,
               ciphertextMiB: plaintext ? cacheSettings.ciphertextMiB : selected,
             ),
@@ -331,7 +333,7 @@ class ReaderSettingsPage extends StatelessWidget {
                   const Padding(
                     padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
                     child: Text(
-                      '缓存仅保存在内存。文件读取缓存有利于重复读取和来回拖动；密文缓存用于合并 BitLocker 小读取。\n'
+                      '以上两项读取缓存仅保存在内存。文件读取缓存有利于重复读取和来回拖动；密文缓存用于合并 BitLocker 小读取。\n'
                       '按每个已解锁卷分别计算，多个卷会累加。修改后重新解锁或重新打开镜像生效。',
                       style: TextStyle(fontSize: 12, color: Color(0xff718098)),
                     ),
@@ -345,6 +347,40 @@ class ReaderSettingsPage extends StatelessWidget {
                     enabled: !busy,
                     onTap: onCredentials,
                   ),
+                  const Divider(),
+                  SwitchListTile.adaptive(
+                    key: const Key('thumbnail-disk'),
+                    title: const Text('普通卷缩略图缓存到本机'),
+                    subtitle: const Text('加快再次浏览；本地缩略图缓存总上限 256 MiB'),
+                    value: cacheSettings.thumbnailDisk,
+                    onChanged: onCacheSettings == null
+                        ? null
+                        : (value) => onCacheSettings!(
+                            cacheSettings.copyWith(thumbnailDisk: value),
+                          ),
+                  ),
+                  SwitchListTile.adaptive(
+                    key: const Key('bitlocker-thumbnail-disk'),
+                    title: const Text('BitLocker 缩略图缓存到本机'),
+                    subtitle: const Text(
+                      '默认关闭。开启后会在设备上保存未加密的图片和视频缩略图；锁定卷后应用不再显示，但本地文件仍保留。关闭此项会删除已有缓存。',
+                    ),
+                    value: cacheSettings.bitLockerThumbnailDisk,
+                    onChanged: onCacheSettings == null
+                        ? null
+                        : (value) => onCacheSettings!(
+                            cacheSettings.copyWith(
+                              bitLockerThumbnailDisk: value,
+                            ),
+                          ),
+                  ),
+                  ListTile(
+                    key: const Key('clear-thumbnails'),
+                    leading: const Icon(Icons.delete_sweep_outlined),
+                    title: const Text('清空缩略图缓存'),
+                    onTap: onClearThumbnails,
+                  ),
+                  const Divider(),
                 ],
               ),
             ),

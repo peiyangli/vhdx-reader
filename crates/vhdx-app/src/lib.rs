@@ -324,17 +324,19 @@ impl State {
                     self.runtime = Some(Runtime::load(&directory)?);
                 }
                 let runtime = self.runtime.as_ref().unwrap().clone();
-                let image = if let Some(fd) = fd {
-                    Image::from_source(
-                        runtime,
-                        Rc::new(LocalFile::from_file(duplicate_file_descriptor(*fd)?)?),
-                    )?
+                let source = Rc::new(if let Some(fd) = fd {
+                    LocalFile::from_file(duplicate_file_descriptor(*fd)?)?
                 } else {
-                    Image::open(runtime, Path::new(path))?
-                };
+                    LocalFile::open(Path::new(path))?
+                });
+                let revision = source.cache_revision();
+                let image = Image::from_source(runtime, source)?;
                 cancel.check()?;
-                let data = serde_json::to_value(&image.info)
+                let mut data = serde_json::to_value(&image.info)
                     .map_err(|_| Error::Invalid("image info".into()))?;
+                if let Some(revision) = revision {
+                    data["source_revision"] = Value::String(revision);
+                }
                 self.image = Some(image);
                 Ok(data)
             }
