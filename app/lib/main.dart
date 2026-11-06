@@ -19,6 +19,7 @@ import 'screen_layout.dart';
 import 'cache_settings.dart';
 import 'thumbnails.dart';
 import 'recent_images.dart';
+import 'browser_settings.dart';
 
 Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -27,12 +28,16 @@ Future<void> main(List<String> args) async {
     SystemChrome.setSystemUIOverlayStyle(readerSystemStyle);
   }
   final cacheSettings = await const CacheSettingsStore().load();
+  final browserStore = BrowserSettingsStore();
+  final browserSettings = await browserStore.load();
   final recents = RecentImagesStore();
   await recents.load();
   runApp(
     _Bootstrap(
       initialImage: args.isEmpty ? null : args.first,
       cacheSettings: cacheSettings,
+      browserSettings: browserSettings,
+      saveBrowserSettings: browserStore.save,
       recents: recents,
     ),
   );
@@ -71,8 +76,12 @@ class _Bootstrap extends StatefulWidget {
     this.initialImage,
     required this.cacheSettings,
     required this.recents,
+    required this.browserSettings,
+    required this.saveBrowserSettings,
   });
   final RecentImagesStore recents;
+  final BrowserSettings browserSettings;
+  final Future<void> Function(BrowserSettings) saveBrowserSettings;
   final String? initialImage;
   final CacheSettings cacheSettings;
   @override
@@ -90,6 +99,8 @@ class _BootstrapState extends State<_Bootstrap> {
           backend: snapshot.data!,
           initialImage: widget.initialImage,
           cacheSettings: widget.cacheSettings,
+          browserSettings: widget.browserSettings,
+          saveBrowserSettings: widget.saveBrowserSettings,
           recents: widget.recents,
         );
       }
@@ -131,8 +142,12 @@ class ReaderApp extends StatelessWidget {
     this.platform,
     this.cacheSettings = const CacheSettings(),
     this.saveCacheSettings,
+    this.browserSettings = const BrowserSettings(),
+    this.saveBrowserSettings,
     this.recents,
   });
+  final BrowserSettings browserSettings;
+  final Future<void> Function(BrowserSettings)? saveBrowserSettings;
   final RecentImagesStore? recents;
   final CacheSettings cacheSettings;
   final Future<void> Function(CacheSettings)? saveCacheSettings;
@@ -158,6 +173,8 @@ class ReaderApp extends StatelessWidget {
       cacheSettings: cacheSettings,
       saveCacheSettings: saveCacheSettings ?? const CacheSettingsStore().save,
       recents: recents,
+      browserSettings: browserSettings,
+      saveBrowserSettings: saveBrowserSettings,
     ),
   );
 }
@@ -180,10 +197,14 @@ class _ReaderWorkspace extends StatefulWidget {
     required this.platform,
     required this.cacheSettings,
     required this.saveCacheSettings,
+    required this.browserSettings,
+    this.saveBrowserSettings,
     this.recents,
   });
   final CacheSettings cacheSettings;
   final Future<void> Function(CacheSettings) saveCacheSettings;
+  final BrowserSettings browserSettings;
+  final Future<void> Function(BrowserSettings)? saveBrowserSettings;
   final RecentImagesStore? recents;
   final TargetPlatform platform;
   final ReaderBackend backend;
@@ -327,6 +348,7 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
       tab.backend.cancel();
     }
     await Future.wait(_tabs.map((tab) => tab.backend.dispose()));
+    await _browserSave;
     await windowAction('quit');
   }
 
@@ -347,7 +369,25 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
     }
   }
 
-  bool _showSystem = false;
+  late BrowserSettings _browserSettings = widget.browserSettings;
+  bool get _showSystem => _browserSettings.showSystem;
+  Future<void> _browserSave = Future.value();
+
+  void _setBrowserSettings(BrowserSettings value) {
+    setState(() => _browserSettings = value);
+    final save = widget.saveBrowserSettings;
+    if (save == null) return;
+    _browserSave = Future.sync(() => save(value)).catchError((Object _) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+          ..clearSnackBars()
+          ..showSnackBar(
+            const SnackBar(content: Text('无法保存文件列表设置，本次显示仍生效，请重试。')),
+          );
+      }
+    });
+  }
+
   ScreenDirection _direction = ScreenDirection.automatic;
   bool _directionBusy = true;
   bool _shakeEnabled = false;
@@ -621,7 +661,8 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
               _windowVisible &&
               _foreground,
           onSettings: () => setState(() => _settingsOpen = true),
-          showSystem: _showSystem,
+          browserSettings: _browserSettings,
+          onBrowserSettings: _setBrowserSettings,
           images: {
             for (final image in _tabs)
               if (image.path != null) image.id: image.path!,
@@ -633,7 +674,6 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
             if (index >= 0) setState(() => _active = index);
           },
           onCredentials: _credentials,
-          onShowSystem: (value) => setState(() => _showSystem = value),
           onOpenImages: _openImages,
           onClose: () => _closeTab(tab),
           onBusyChanged: (busy) {
@@ -686,7 +726,9 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
                     : _setShakeRotation,
                 showSystem: _showSystem,
                 busy: _opening || _tabs.any((tab) => tab.busy),
-                onShowSystem: (value) => setState(() => _showSystem = value),
+                onShowSystem: (value) => _setBrowserSettings(
+                  _browserSettings.copyWith(showSystem: value),
+                ),
                 onCredentials: _credentials,
                 onBack: () => setState(() => _settingsOpen = false),
               ),
@@ -710,14 +752,14 @@ class ReaderHome extends StatefulWidget {
     required this.onBusyChanged,
     required this.active,
     required this.platform,
-    this.showSystem = false,
+    required this.browserSettings,
+    required this.onBrowserSettings,
     this.workspaceBusy = false,
     this.images = const {},
     this.activeImageId,
     this.onSelectImage,
     this.onCredentials,
     this.onSettings,
-    this.onShowSystem,
     this.cacheSettings = const CacheSettings(),
     this.thumbnails,
     this.recents = const [],
@@ -740,14 +782,14 @@ class ReaderHome extends StatefulWidget {
   final Future<void> Function() onClose;
   final ValueChanged<bool> onBusyChanged;
   final bool active;
-  final bool showSystem;
+  final BrowserSettings browserSettings;
+  final ValueChanged<BrowserSettings> onBrowserSettings;
   final bool workspaceBusy;
   final Map<int, String> images;
   final int? activeImageId;
   final ValueChanged<int>? onSelectImage;
   final VoidCallback? onSettings;
   final Future<void> Function()? onCredentials;
-  final ValueChanged<bool>? onShowSystem;
   @override
   State<ReaderHome> createState() => _ReaderHomeState();
 }
@@ -761,10 +803,10 @@ class _ReaderHomeState extends State<ReaderHome> {
   bool _unlocked = false;
   bool _busy = false;
   bool _showPassword = false;
-  bool _showSystem = false;
-  bool _grid = false;
-  FileSort _sort = FileSort.name;
-  bool _descending = false;
+  bool get _showSystem => widget.browserSettings.showSystem;
+  bool get _grid => widget.browserSettings.grid;
+  FileSort get _sort => widget.browserSettings.sort;
+  bool get _descending => widget.browserSettings.descending;
   String _mode = 'password';
   String? _credentialFile;
   bool get _credentialProtectionRequired =>
@@ -804,7 +846,6 @@ class _ReaderHomeState extends State<ReaderHome> {
   @override
   void initState() {
     super.initState();
-    _showSystem = widget.showSystem;
     if (widget.initialImage != null) {
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => _open(widget.initialImage!),
@@ -821,8 +862,7 @@ class _ReaderHomeState extends State<ReaderHome> {
         if (mounted) _desktopFocus.requestFocus();
       });
     }
-    if (oldWidget.showSystem != widget.showSystem) {
-      _showSystem = widget.showSystem;
+    if (oldWidget.browserSettings.showSystem != _showSystem) {
       if (_unlocked) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) unawaited(_run('正在读取目录…', () => _load(_path)));
@@ -2005,25 +2045,39 @@ class _ReaderHomeState extends State<ReaderHome> {
   Future<void> _menuAction(String action) async {
     switch (action) {
       case 'view-list':
-        setState(() => _grid = false);
+        widget.onBrowserSettings(widget.browserSettings.copyWith(grid: false));
       case 'view-grid':
-        setState(() => _grid = true);
+        widget.onBrowserSettings(widget.browserSettings.copyWith(grid: true));
       case 'sort-name':
-        setState(() => _sort = FileSort.name);
+        widget.onBrowserSettings(
+          widget.browserSettings.copyWith(sort: FileSort.name),
+        );
       case 'sort-modified':
-        setState(() => _sort = FileSort.modified);
+        widget.onBrowserSettings(
+          widget.browserSettings.copyWith(sort: FileSort.modified),
+        );
       case 'sort-size':
-        setState(() => _sort = FileSort.size);
+        widget.onBrowserSettings(
+          widget.browserSettings.copyWith(sort: FileSort.size),
+        );
       case 'sort-type':
-        setState(() => _sort = FileSort.type);
+        widget.onBrowserSettings(
+          widget.browserSettings.copyWith(sort: FileSort.type),
+        );
       case 'order-ascending':
-        setState(() => _descending = false);
+        widget.onBrowserSettings(
+          widget.browserSettings.copyWith(descending: false),
+        );
       case 'order-descending':
-        setState(() => _descending = true);
+        widget.onBrowserSettings(
+          widget.browserSettings.copyWith(descending: true),
+        );
       case 'open-image':
         await widget.onOpenImages();
       case 'show-system':
-        widget.onShowSystem?.call(!_showSystem);
+        widget.onBrowserSettings(
+          widget.browserSettings.copyWith(showSystem: !_showSystem),
+        );
       case 'credential-manager':
         await widget.onCredentials?.call();
       case 'refresh':
