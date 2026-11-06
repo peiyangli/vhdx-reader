@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'window_chrome.dart';
 import 'package:flutter/services.dart';
 
 /// Independent from the decoder so gesture arbitration can be tested directly.
@@ -17,6 +19,7 @@ class PlaybackControls extends StatefulWidget {
     this.buffering = false,
     this.error,
     this.enabled = true,
+    this.seekSeconds = 5,
     this.onPrevious,
     this.onNext,
     this.onHoldStart,
@@ -27,6 +30,7 @@ class PlaybackControls extends StatefulWidget {
     this.pulling = false,
   });
   final bool enabled;
+  final int seekSeconds;
   final ValueChanged<double>? onPullUpdate;
   final ValueChanged<double>? onPullEnd;
   final VoidCallback? onPullCancel;
@@ -50,6 +54,62 @@ class PlaybackControls extends StatefulWidget {
 }
 
 class _PlaybackControlsState extends State<PlaybackControls> {
+  final _keyboardFocus = FocusNode();
+  Map<ShortcutActivator, VoidCallback> get _bindings => {
+    const SingleActivator(LogicalKeyboardKey.escape): widget.onExit,
+    const SingleActivator(LogicalKeyboardKey.arrowLeft): () => _skip(-1),
+    const SingleActivator(LogicalKeyboardKey.arrowRight): () => _skip(1),
+    const SingleActivator(LogicalKeyboardKey.keyM, includeRepeats: false): () {
+      if (widget.enabled && !widget.pulling) widget.onMute?.call();
+    },
+    const SingleActivator(
+      LogicalKeyboardKey.arrowLeft,
+      shift: true,
+      includeRepeats: false,
+    ): () {
+      if (widget.enabled && !widget.pulling) widget.onPrevious?.call();
+    },
+    const SingleActivator(
+      LogicalKeyboardKey.arrowRight,
+      shift: true,
+      includeRepeats: false,
+    ): () {
+      if (widget.enabled && !widget.pulling) widget.onNext?.call();
+    },
+    const SingleActivator(LogicalKeyboardKey.space, includeRepeats: false): () {
+      if (widget.enabled && !widget.pulling) widget.onPlay();
+    },
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    FocusManager.instance.addEarlyKeyEventHandler(_handleKey);
+    _focusWhenReady();
+  }
+
+  void _focusWhenReady() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && widget.enabled) _keyboardFocus.requestFocus();
+    });
+  }
+
+  // Handle preview shortcuts before a focused slider/button consumes the same
+  // keys. Scope to this preview's focus tree so dialogs and other tabs keep
+  // their own keyboard behavior.
+  KeyEventResult _handleKey(KeyEvent event) {
+    if (!isDesktopPlatform(defaultTargetPlatform) || !_keyboardFocus.hasFocus) {
+      return KeyEventResult.ignored;
+    }
+    for (final entry in _bindings.entries) {
+      if (entry.key.accepts(event, HardwareKeyboard.instance)) {
+        entry.value();
+        return KeyEventResult.handled;
+      }
+    }
+    return KeyEventResult.ignored;
+  }
+
   bool _visible = true;
   double? _seek;
   double _down = 0;
@@ -77,13 +137,27 @@ class _PlaybackControlsState extends State<PlaybackControls> {
   void didUpdateWidget(covariant PlaybackControls oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (!widget.enabled) _endHold(rebuild: false);
+    if (widget.enabled && !oldWidget.enabled) _focusWhenReady();
   }
 
   @override
   void dispose() {
+    FocusManager.instance.removeEarlyKeyEventHandler(_handleKey);
+    _keyboardFocus.dispose();
     _noticeTimer?.cancel();
     _endHold(rebuild: false);
     super.dispose();
+  }
+
+  void _skip(int direction) {
+    if (!widget.enabled || widget.pulling || widget.duration <= Duration.zero) {
+      return;
+    }
+    final milliseconds =
+        (widget.position.inMilliseconds + direction * widget.seekSeconds * 1000)
+            .clamp(0, widget.duration.inMilliseconds);
+    widget.onSeek(Duration(milliseconds: milliseconds));
+    _boundary('${direction < 0 ? '快退' : '快进'} ${widget.seekSeconds} 秒');
   }
 
   void _toggleControls() => setState(() => _visible = !_visible);
@@ -97,19 +171,9 @@ class _PlaybackControlsState extends State<PlaybackControls> {
       duration > 0 ? duration : 1.0,
     );
     return CallbackShortcuts(
-      bindings: {
-        const SingleActivator(LogicalKeyboardKey.escape): widget.onExit,
-        const SingleActivator(LogicalKeyboardKey.arrowLeft): () {
-          if (widget.enabled && !widget.pulling) widget.onPrevious?.call();
-        },
-        const SingleActivator(LogicalKeyboardKey.arrowRight): () {
-          if (widget.enabled && !widget.pulling) widget.onNext?.call();
-        },
-        const SingleActivator(LogicalKeyboardKey.space): () {
-          if (widget.enabled && !widget.pulling) widget.onPlay();
-        },
-      },
+      bindings: _bindings,
       child: Focus(
+        focusNode: _keyboardFocus,
         autofocus: true,
         child: Stack(
           fit: StackFit.expand,

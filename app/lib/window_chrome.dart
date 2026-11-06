@@ -2,6 +2,18 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+bool isDesktopPlatform(TargetPlatform platform) =>
+    platform == TargetPlatform.windows ||
+    platform == TargetPlatform.macOS ||
+    platform == TargetPlatform.linux;
+
+// Desktop visibility is controlled by the native hidden/shown tray events.
+// Focus and minimize lifecycle changes must not suspend playback.
+bool readerIsForeground(TargetPlatform platform, AppLifecycleState? state) =>
+    isDesktopPlatform(platform) ||
+    state == null ||
+    state == AppLifecycleState.resumed;
+
 const _windowChannel = MethodChannel('vhdx_reader/window');
 
 Future<void> windowAction(String action) async {

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'dart:ui' show PointerDeviceKind;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -15,6 +16,7 @@ void main() {
     VoidCallback? holdStart,
     VoidCallback? holdEnd,
     bool enabled = true,
+    int seekSeconds = 5,
     ValueChanged<Duration>? seek,
     Duration duration = const Duration(seconds: 60),
   }) async {
@@ -36,6 +38,7 @@ void main() {
             onHoldStart: holdStart,
             onHoldEnd: holdEnd,
             enabled: enabled,
+            seekSeconds: seekSeconds,
           ),
         ),
       ),
@@ -258,8 +261,86 @@ void main() {
     await mouse.up();
     await tester.pumpAndSettle();
     expect(ends, 1);
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
     await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
     await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
     expect([previous, next], [1, 1]);
   });
+  testWidgets(
+    'arrows seek configured seconds, clamp bounds and respect disabled state',
+    (tester) async {
+      final targets = <Duration>[];
+      var mutes = 0;
+      await show(
+        tester,
+        seekSeconds: 15,
+        seek: targets.add,
+        mute: () => mutes++,
+        duration: const Duration(seconds: 20),
+      );
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyM);
+      expect(targets, [Duration.zero, const Duration(seconds: 20)]);
+      expect(mutes, 1);
+      await show(
+        tester,
+        enabled: false,
+        seek: targets.add,
+        mute: () => mutes++,
+      );
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyM);
+      expect(targets.length, 2);
+      expect(mutes, 1);
+      await tester.pumpWidget(const SizedBox.shrink());
+    },
+  );
+  testWidgets(
+    'desktop shortcuts override focused controls but not dialog input',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      var plays = 0, mutes = 0;
+      final seeks = <Duration>[];
+      await show(
+        tester,
+        play: () => plays++,
+        mute: () => mutes++,
+        seek: seeks.add,
+        seekSeconds: 15,
+      );
+      Focus.of(tester.element(find.byIcon(Icons.volume_up))).requestFocus();
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      expect(plays, 1);
+      expect(mutes, 0);
+      final sliderFocus = find
+          .descendant(
+            of: find.byType(Slider),
+            matching: find.byType(FocusableActionDetector),
+          )
+          .first;
+      tester
+          .widget<FocusableActionDetector>(sliderFocus)
+          .focusNode!
+          .requestFocus();
+      await tester.pump();
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      expect(seeks, [const Duration(seconds: 25)]);
+      final context = tester.element(find.byType(PlaybackControls));
+      showDialog<void>(
+        context: context,
+        builder: (_) => const AlertDialog(content: TextField(autofocus: true)),
+      );
+      await tester.pumpAndSettle();
+      await tester.sendKeyEvent(LogicalKeyboardKey.space);
+      await tester.sendKeyEvent(LogicalKeyboardKey.arrowRight);
+      expect(plays, 1);
+      expect(seeks.length, 1);
+      await tester.pumpWidget(const SizedBox.shrink());
+      debugDefaultTargetPlatformOverride = null;
+    },
+  );
 }

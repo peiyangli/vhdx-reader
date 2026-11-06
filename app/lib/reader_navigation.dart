@@ -4,6 +4,7 @@ import 'recent_images.dart';
 import 'window_chrome.dart';
 import 'screen_layout.dart';
 import 'cache_settings.dart';
+import 'browser_settings.dart';
 import 'package:flutter/services.dart';
 
 class DiskDrawer extends StatelessWidget {
@@ -215,7 +216,11 @@ class ReaderSettingsPage extends StatelessWidget {
     this.cacheSettings = const CacheSettings(),
     this.onCacheSettings,
     this.onClearThumbnails,
+    this.seekSeconds = 5,
+    this.onSeekSeconds,
   });
+  final int seekSeconds;
+  final ValueChanged<int>? onSeekSeconds;
   final Future<void> Function()? onClearThumbnails;
   final CacheSettings cacheSettings;
   final ValueChanged<CacheSettings>? onCacheSettings;
@@ -395,6 +400,43 @@ class ReaderSettingsPage extends StatelessWidget {
                         value: shakeEnabled,
                         onChanged: onShake,
                       ),
+                    const Divider(),
+                  ],
+                  if (onSeekSeconds != null) ...[
+                    ListTile(
+                      key: const Key('playback-seek-seconds'),
+                      leading: const Icon(Icons.keyboard_outlined),
+                      title: const Text('快进 / 快退步长'),
+                      subtitle: Text('$seekSeconds 秒'),
+                      trailing: const Icon(Icons.chevron_right, size: 20),
+                      onTap: () async {
+                        final selected = await showDialog<int>(
+                          context: context,
+                          builder: (context) => SimpleDialog(
+                            title: const Text('快进 / 快退步长'),
+                            children: [
+                              for (final seconds in BrowserSettings.seekOptions)
+                                SimpleDialogOption(
+                                  key: ValueKey('seek-seconds-$seconds'),
+                                  onPressed: () =>
+                                      Navigator.pop(context, seconds),
+                                  child: Text(
+                                    '$seconds 秒${seconds == seekSeconds ? ' ✓' : ''}',
+                                  ),
+                                ),
+                            ],
+                          ),
+                        );
+                        if (selected != null) onSeekSeconds!(selected);
+                      },
+                    ),
+                    const Padding(
+                      padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+                      child: Text(
+                        '视频快捷键：空格 播放 / 暂停；← / → 快退 / 快进；\n'
+                        'Shift + ← / → 上一个 / 下一个；M 静音；Esc 返回列表。',
+                      ),
+                    ),
                     const Divider(),
                   ],
                   SwitchListTile.adaptive(

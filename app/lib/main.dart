@@ -256,17 +256,7 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (mounted) {
-      // Desktop inactive means unfocused, not hidden. Treating focus changes
-      // as backgrounding repeatedly cancels visible thumbnail work.
-      final desktop =
-          widget.platform == TargetPlatform.windows ||
-          widget.platform == TargetPlatform.macOS ||
-          widget.platform == TargetPlatform.linux;
-      setState(
-        () => _foreground =
-            state == AppLifecycleState.resumed ||
-            (desktop && state == AppLifecycleState.inactive),
-      );
+      setState(() => _foreground = readerIsForeground(widget.platform, state));
     }
   }
 
@@ -708,6 +698,12 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
             if (_settingsOpen)
               ReaderSettingsPage(
                 key: const Key('reader-settings-page'),
+                seekSeconds: _browserSettings.seekSeconds,
+                onSeekSeconds: isDesktopPlatform(widget.platform)
+                    ? (value) => _setBrowserSettings(
+                        _browserSettings.copyWith(seekSeconds: value),
+                      )
+                    : null,
                 cacheSettings: _cacheSettings,
                 onCacheSettings: _cacheSettingsBusy ? null : _setCacheSettings,
                 onClearThumbnails: _clearThumbnails,
@@ -1744,6 +1740,7 @@ class _ReaderHomeState extends State<ReaderHome> {
               child: PreviewScreen(
                 key: _previewKey,
                 data: _preview!,
+                seekSeconds: widget.browserSettings.seekSeconds,
                 active: widget.active,
                 onExport: _busy ? null : _export,
                 onBack: _goBack,

@@ -103,6 +103,7 @@ class PreviewPane extends StatefulWidget {
     this.active = true,
     this.onBack,
     this.onPrevious,
+    this.seekSeconds = 5,
     this.onNext,
     this.busy = false,
     this.message,
@@ -111,6 +112,7 @@ class PreviewPane extends StatefulWidget {
   final VoidCallback? onExport;
   final bool active;
   final VoidCallback? onBack;
+  final int seekSeconds;
   final VoidCallback? onPrevious;
   final VoidCallback? onNext;
   final bool busy;
@@ -152,6 +154,7 @@ class _PreviewPaneState extends State<PreviewPane> {
         key: ObjectKey(data!.media),
         source: data.media!,
         active: widget.active,
+        seekSeconds: widget.seekSeconds,
         onExit: widget.onBack ?? () {},
         onPrevious: widget.onPrevious,
         onNext: widget.onNext,
@@ -330,8 +333,10 @@ class PreviewScreen extends StatefulWidget {
     this.error,
     this.busy = false,
     this.onPrevious,
+    this.seekSeconds = 5,
     this.onNext,
   });
+  final int seekSeconds;
   final VoidCallback? onPrevious;
   final VoidCallback? onNext;
   final PreviewData data;
@@ -380,6 +385,7 @@ class _PreviewScreenState extends State<PreviewScreen> {
     final pane = PreviewPane(
       data: widget.data,
       active: widget.active,
+      seekSeconds: widget.seekSeconds,
       onExport: widget.onExport,
       onBack: widget.onBack,
       onPrevious: widget.onPrevious,

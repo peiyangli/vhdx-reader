@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 import 'platform_storage.dart';
+import 'window_chrome.dart';
+import 'package:flutter/foundation.dart';
 import 'playback_controls.dart';
 import 'media_playback_events.dart';
 import 'video_dismiss_view.dart';
@@ -334,11 +336,13 @@ class MediaPreview extends StatefulWidget {
     this.onPrevious,
     this.onNext,
     this.switching = false,
+    this.seekSeconds = 5,
     this.message,
   });
   final VoidCallback? onPrevious;
   final VoidCallback? onNext;
   final bool switching;
+  final int seekSeconds;
   final String? message;
   final MediaPreviewSource source;
   final bool active;
@@ -352,7 +356,7 @@ class _MediaPreviewState extends State<MediaPreview>
   bool _foreground = true;
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final active = state == AppLifecycleState.resumed;
+    final active = readerIsForeground(defaultTargetPlatform, state);
     if (!active) unawaited(widget.source.suspend());
     if (active) widget.source.setVisible(widget.active);
     if (mounted) setState(() => _foreground = active);
@@ -370,7 +374,7 @@ class _MediaPreviewState extends State<MediaPreview>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     final lifecycle = WidgetsBinding.instance.lifecycleState;
-    _foreground = lifecycle == null || lifecycle == AppLifecycleState.resumed;
+    _foreground = readerIsForeground(defaultTargetPlatform, lifecycle);
     widget.source.setVisible(widget.active && _foreground);
   }
 
@@ -392,12 +396,15 @@ class _MediaPreviewState extends State<MediaPreview>
       controller: widget.source.controller,
       controls: NoVideoControls,
       fill: Colors.transparent,
-      pauseUponEnteringBackgroundMode: true,
+      pauseUponEnteringBackgroundMode: !isDesktopPlatform(
+        defaultTargetPlatform,
+      ),
       resumeUponEnteringForegroundMode: false,
     ),
     controls: (update, end, cancel, pulling) => AnimatedBuilder(
       animation: widget.source,
       builder: (context, child) => PlaybackControls(
+        seekSeconds: widget.seekSeconds,
         position: widget.source.position,
         duration: widget.source.duration,
         playing: widget.source.playing,

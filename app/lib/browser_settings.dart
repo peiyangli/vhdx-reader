@@ -8,10 +8,13 @@ import 'file_browser.dart';
 class BrowserSettings {
   const BrowserSettings({
     this.grid = false,
+    this.seekSeconds = 5,
     this.sort = FileSort.name,
     this.descending = false,
     this.showSystem = false,
   });
+  static const seekOptions = [3, 5, 10, 15, 30];
+  final int seekSeconds;
   final bool grid;
   final FileSort sort;
   final bool descending;
@@ -19,11 +22,13 @@ class BrowserSettings {
 
   BrowserSettings copyWith({
     bool? grid,
+    int? seekSeconds,
     FileSort? sort,
     bool? descending,
     bool? showSystem,
   }) => BrowserSettings(
     grid: grid ?? this.grid,
+    seekSeconds: seekSeconds ?? this.seekSeconds,
     sort: sort ?? this.sort,
     descending: descending ?? this.descending,
     showSystem: showSystem ?? this.showSystem,
@@ -31,6 +36,7 @@ class BrowserSettings {
 
   Map<String, dynamic> toJson() => {
     'grid': grid,
+    'seek_seconds': seekSeconds,
     'sort': sort.name,
     'descending': descending,
     'show_system': showSystem,
@@ -40,6 +46,11 @@ class BrowserSettings {
     if (value is! Map) return const BrowserSettings();
     return BrowserSettings(
       grid: value['grid'] == true,
+      seekSeconds:
+          value['seek_seconds'] is int &&
+              seekOptions.contains(value['seek_seconds'])
+          ? value['seek_seconds'] as int
+          : 5,
       sort: FileSort.values.firstWhere(
         (sort) => sort.name == value['sort'],
         orElse: () => FileSort.name,

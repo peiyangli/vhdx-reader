@@ -19,6 +19,7 @@ void main() {
         final store = BrowserSettingsStore(directory: directory);
         expect((await store.load()).toJson(), const BrowserSettings().toJson());
         const latest = BrowserSettings(
+          seekSeconds: 15,
           grid: true,
           sort: FileSort.type,
           descending: true,
@@ -61,6 +62,46 @@ void main() {
       }
     },
   );
+
+  test('seek preference rejects invalid and legacy values', () {
+    for (final value in [null, '10', -1, 0, 999, 10.0]) {
+      expect(BrowserSettings.fromJson({'seek_seconds': value}).seekSeconds, 5);
+    }
+    expect(BrowserSettings.fromJson({'seek_seconds': 10}).seekSeconds, 10);
+  });
+
+  testWidgets('desktop seek setting saves and restores', (tester) async {
+    BrowserSettings saved = const BrowserSettings();
+    await tester.pumpWidget(
+      ReaderApp(
+        backend: PagedBackend()..reject = false,
+        initialImage: 'one.vhdx',
+        platform: TargetPlatform.windows,
+        saveBrowserSettings: (value) async => saved = value,
+      ),
+    );
+    await tester.pumpAndSettle();
+    await openReaderSettings(tester);
+    await tester.tap(find.byKey(const Key('playback-seek-seconds')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('seek-seconds-15')));
+    await tester.pumpAndSettle();
+    expect(saved.seekSeconds, 15);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(
+      ReaderApp(
+        backend: PagedBackend()..reject = false,
+        initialImage: 'two.vhdx',
+        platform: TargetPlatform.windows,
+        browserSettings: saved,
+      ),
+    );
+    await tester.pumpAndSettle();
+    await openReaderSettings(tester);
+    expect(find.text('15 秒'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 
   test('failed save does not prevent a later preference save', () async {
     final root = await Directory.systemTemp.createTemp('browser-retry-');
