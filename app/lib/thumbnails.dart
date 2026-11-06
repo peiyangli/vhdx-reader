@@ -109,6 +109,8 @@ class ThumbnailRequest {
   final VoidCallback cancel;
 }
 
+class _UnsupportedThumbnail implements Exception {}
+
 class _Job {
   _Job(this.scope, this.path, this.entry, this.key, this.diskKey);
   final ThumbnailScope scope;
@@ -161,7 +163,7 @@ class ThumbnailCache extends ChangeNotifier {
   final int diskLimit;
   final _memory = <String, Thumbnail>{};
   final _owners = <String, ThumbnailScope>{};
-  final _failures = <String, ({DateTime at, int attempts})>{};
+  final _failures = <String, ({DateTime at, int attempts, bool terminal})>{};
   final _jobs = <String, _Job>{};
   final _queue = Queue<_Job>();
   final _lookupQueue = Queue<_Job>();
@@ -178,9 +180,48 @@ class ThumbnailCache extends ChangeNotifier {
     return result;
   }
 
-  Future<Directory> _root() async =>
+  Future<Directory>? _rootFuture;
+  Future<Directory> _root() => _rootFuture ??= _findRoot();
+  Future<Directory> _findRoot() async =>
       directory ??
       Directory('${(await getApplicationCacheDirectory()).path}/thumbnails-v1');
+  Map<String, ({int size, DateTime used})>? _diskEntries;
+  int _diskBytes = 0;
+  void _forgetDisk(String key) {
+    final old = _diskEntries?.remove(key);
+    if (old != null) _diskBytes -= old.size;
+  }
+
+  Future<void> _indexDisk(Directory root) async {
+    if (_diskEntries != null) return;
+    final entries = <String, ({int size, DateTime used})>{};
+    var bytes = 0;
+    await for (final file in root.list(followLinks: false)) {
+      if (file is! File) continue;
+      final stat = await file.stat();
+      if (stat.type != FileSystemEntityType.file) continue;
+      entries[file.uri.pathSegments.last] = (
+        size: stat.size,
+        used: stat.modified,
+      );
+      bytes += stat.size;
+    }
+    _diskEntries = entries;
+    _diskBytes = bytes;
+  }
+
+  Future<void> _trimDisk(Directory root) async {
+    if (_diskBytes <= diskLimit) return;
+    final entries = _diskEntries!.entries.toList()
+      ..sort((a, b) => a.value.used.compareTo(b.value.used));
+    for (final entry in entries) {
+      if (_diskBytes <= diskLimit) break;
+      final file = File('${root.path}/${entry.key}');
+      if (await file.exists()) await file.delete();
+      _forgetDisk(entry.key);
+    }
+  }
+
   bool _persistent(ThumbnailScope scope) => scope.encrypted
       ? settings.bitLockerThumbnailDisk
       : settings.thumbnailDisk;
@@ -206,6 +247,8 @@ class ThumbnailCache extends ChangeNotifier {
 
   Future<void> clearDisk({bool? encrypted}) => _disk(() async {
     final root = await _root();
+    _diskEntries = null;
+    _diskBytes = 0;
     if (!await root.exists()) return;
     await for (final file in root.list(followLinks: false)) {
       if (file is File &&
@@ -281,7 +324,9 @@ class ThumbnailCache extends ChangeNotifier {
   ) {
     if (_disposed || !scope.available) return null;
     final failure = _failures[_key(scope, _hash(scope, path, entry))];
-    if (failure == null || failure.attempts >= 3) return null;
+    if (failure == null || failure.terminal || failure.attempts >= 3) {
+      return null;
+    }
     final wait =
         Duration(seconds: failure.attempts == 1 ? 1 : 3) -
         DateTime.now().difference(failure.at);
@@ -305,14 +350,15 @@ class ThumbnailCache extends ChangeNotifier {
     }
     final failure = _failures[key];
     if (failure != null &&
-        DateTime.now().difference(failure.at) <
-            Duration(
-              seconds: failure.attempts >= 3
-                  ? 30
-                  : failure.attempts == 1
-                  ? 1
-                  : 3,
-            )) {
+        (failure.terminal ||
+            DateTime.now().difference(failure.at) <
+                Duration(
+                  seconds: failure.attempts >= 3
+                      ? 30
+                      : failure.attempts == 1
+                      ? 1
+                      : 3,
+                ))) {
       return ThumbnailRequest(Future.value(), () {});
     }
     var job = _jobs[key];
@@ -449,7 +495,7 @@ class ThumbnailCache extends ChangeNotifier {
       }
       if (!job.done.isCompleted &&
           (job.valid || (job.timedOut && job.scope.available))) {
-        _rememberFailure(job.key);
+        _rememberFailure(job.key, terminal: error is _UnsupportedThumbnail);
       }
       if (!job.done.isCompleted) job.done.complete();
     } finally {
@@ -458,10 +504,11 @@ class ThumbnailCache extends ChangeNotifier {
     }
   }
 
-  void _rememberFailure(String key) {
+  void _rememberFailure(String key, {bool terminal = false}) {
     final previous = _failures[key];
     final now = DateTime.now();
     _failures[key] = (
+      terminal: terminal,
       at: now,
       attempts: previous == null || now.difference(previous.at).inSeconds >= 30
           ? 1
@@ -480,11 +527,26 @@ class ThumbnailCache extends ChangeNotifier {
         job.check();
         if (epoch != _diskEpoch || !_persistent(job.scope)) return null;
         final file = File('${(await _root()).path}/${job.diskKey}');
-        if (!await file.exists() || await file.length() > 1024 * 1024) {
+        final stat = await file.stat();
+        if (stat.type != FileSystemEntityType.file || stat.size > 1024 * 1024) {
+          _forgetDisk(job.diskKey);
           return null;
         }
         final result = jsonDecode(await file.readAsString()) as Map;
-        await file.setLastModified(DateTime.now());
+        final now = DateTime.now();
+        if (_diskEntries != null) {
+          _forgetDisk(job.diskKey);
+          _diskEntries![job.diskKey] = (size: stat.size, used: now);
+          _diskBytes += stat.size;
+        }
+        // Persist approximate LRU age, without a metadata write on every hit.
+        if (now.difference(stat.modified).inSeconds >= 60) {
+          try {
+            await file.setLastModified(now);
+          } on FileSystemException {
+            /* Read-only caches still serve hits. */
+          }
+        }
         return result;
       });
       job.check();
@@ -509,30 +571,25 @@ class ThumbnailCache extends ChangeNotifier {
         if (epoch != _diskEpoch || !_persistent(job.scope)) return;
         final root = await _root();
         await root.create(recursive: true);
+        await _indexDisk(root);
         final destination = File('${root.path}/${job.diskKey}');
-        if (await destination.exists()) return;
+        if (_diskEntries!.containsKey(job.diskKey)) return;
         final temporary = File('${destination.path}.tmp');
         try {
-          await temporary.writeAsString(
-            jsonEncode({
-              'png': base64Encode(bytes.buffer.asUint8List()),
-              'duration': value.duration.inMilliseconds,
-            }),
-          );
+          final encoded = jsonEncode({
+            'png': base64Encode(bytes.buffer.asUint8List()),
+            'duration': value.duration.inMilliseconds,
+          });
+          await temporary.writeAsString(encoded);
           job.check();
           if (epoch != _diskEpoch || !_persistent(job.scope)) return;
           await temporary.rename(destination.path);
-          final entries = <(File, FileStat)>[];
-          await for (final file in root.list(followLinks: false)) {
-            if (file is File) entries.add((file, await file.stat()));
-          }
-          entries.sort((a, b) => a.$2.modified.compareTo(b.$2.modified));
-          var size = entries.fold<int>(0, (sum, entry) => sum + entry.$2.size);
-          for (final entry in entries) {
-            if (size <= diskLimit) break;
-            await entry.$1.delete();
-            size -= entry.$2.size;
-          }
+          _diskEntries![job.diskKey] = (
+            size: encoded.length,
+            used: DateTime.now(),
+          );
+          _diskBytes += encoded.length;
+          await _trimDisk(root);
         } finally {
           if (await temporary.exists()) await temporary.delete();
         }
@@ -569,11 +626,19 @@ class ThumbnailCache extends ChangeNotifier {
 
   Future<Thumbnail?> _generate(_Job job) async {
     if (job.video) {
+      var unsupportedCodec = false;
       final media = await MediaPreviewSource.open(
         job.scope.backend,
         job.path,
         thumbnail: true,
-        onDiagnostic: onError,
+        onDiagnostic: (error) {
+          if (error.toString().contains(
+            'Failed to initialize a decoder for codec',
+          )) {
+            unsupportedCodec = true;
+          }
+          onError?.call(error);
+        },
       );
       Future<void> close() async {
         media.dispose();
@@ -588,7 +653,10 @@ class ThumbnailCache extends ChangeNotifier {
           job.check();
           // Actual end-file failure is terminal for this attempt. Avoid spending
           // the entire polling budget on an unsupported codec or failed open.
-          if (media.error != null) return null;
+          if (media.error != null) {
+            if (unsupportedCodec) throw _UnsupportedThumbnail();
+            return null;
+          }
           // The first decoded frame avoids an extra seek (Android recreates
           // its output surface during startup, which already reopens HTTP).
           if ((await media.statistics())['bytes'] as int > 32 * 1024 * 1024) {

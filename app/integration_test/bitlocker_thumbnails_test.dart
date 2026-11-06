@@ -124,6 +124,24 @@ void main() {
         }
         expect(find.byType(RawImage), findsNWidgets(expected));
         debugPrint('PASS $pass completed in ${clock.elapsedMilliseconds}ms');
+        if (pass == 0) {
+          for (final entry in entries.where((e) => e['name'] != 'rmvb.rmvb')) {
+            expect(
+              backend.mediaPaths
+                  .where((p) => p == '/video/${entry['name']}')
+                  .length,
+              1,
+              reason: 'A supported video must open on the first attempt',
+            );
+          }
+          await Future<void>.delayed(const Duration(seconds: 5));
+          expect(
+            backend.mediaPaths.where((p) => p == '/video/rmvb.rmvb').length,
+            1,
+            reason:
+                'A confirmed unsupported codec must not repeatedly start decoders',
+          );
+        }
         if (pass == 1) {
           expect(
             backend.mediaPaths.where((p) => p != '/video/rmvb.rmvb').length,

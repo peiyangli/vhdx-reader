@@ -75,8 +75,20 @@ impl Stream {
                             if !peer.ip().is_loopback() {
                                 continue;
                             }
-                            let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
-                            let _ = socket.set_write_timeout(Some(Duration::from_secs(2)));
+                            // Windows accept inherits the listener's nonblocking
+                            // mode. Client workers use blocking I/O with deadlines;
+                            // otherwise a delayed/fragmented header or a full send
+                            // buffer aborts an otherwise valid media request.
+                            if socket.set_nonblocking(false).is_err()
+                                || socket
+                                    .set_read_timeout(Some(Duration::from_secs(2)))
+                                    .is_err()
+                                || socket
+                                    .set_write_timeout(Some(Duration::from_secs(2)))
+                                    .is_err()
+                            {
+                                continue;
+                            }
                             if server.active.fetch_add(1, Ordering::AcqRel) >= 4 {
                                 server.active.fetch_sub(1, Ordering::AcqRel);
                                 let _ = status(
@@ -307,6 +319,37 @@ fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepted_connection_waits_for_fragmented_request_headers() {
+        // Windows inherits nonblocking mode from the listener. Wait until the
+        // server has accepted before sending headers, so this catches an early
+        // WouldBlock instead of relying on TCP/scheduler timing.
+        let stream = Stream::start(0, 0, 0, 7).unwrap();
+        let address_and_path = stream.url.strip_prefix("http://").unwrap();
+        let (host, path) = address_and_path.split_once('/').unwrap();
+        let mut client = TcpStream::connect(host).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while stream.shared.next.load(Ordering::Acquire) == 1 {
+            assert!(
+                Instant::now() < deadline,
+                "server did not accept connection"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(50));
+        write!(client, "HEAD /{path} HTTP/1.1\r\n").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        write!(client, "Host: {host}\r\n\r\n").unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("Content-Length: 7\r\n"), "{response}");
+        assert_eq!(stream.stats()["requests"], 1);
+    }
+
     #[test]
     fn byte_ranges_cover_open_suffix_clamp_and_rejection() {
         assert_eq!(range(Some("bytes=2-5"), 10), Ok(Some((2, 5))));
