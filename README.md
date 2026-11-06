@@ -2,7 +2,11 @@
 
 外置 SSD 上的 VHDX / BitLocker / NTFS 只读浏览器。包含 Rust 核心、Windows / Android / macOS / iOS/iPadOS Flutter 界面，以及 Windows / Linux 命令行工具。已接入文本、图片、PDF 内嵌预览和视频播放；独立音频界面仍待实现。
 
-## 当前发布：0.6.11+18
+## 当前桌面测试版：0.6.12+19
+
+当前源码已为 Windows/macOS 使用已保存 BitLocker 凭据接入系统身份验证：Windows 11+ 使用 Windows Hello PIN/指纹/人脸，Mac 使用 Touch ID/登录密码。已有记录同样受保护，取消或不可用时保留手动解锁；已打开的卷仍需主动锁定或关闭。Windows x64 和 macOS ARM64 测试包均位于 `artifacts/0.6.12/`，与 `manifest.json`、`SHA256SUMS` 平铺存放。Windows 完整解压后运行 `vhdx_reader.exe`；Mac 解压后运行 `VHDX Reader.app`。Windows 需先配置 Windows Hello；Mac 使用 Touch ID 或登录密码。首次解锁时勾选记住，再锁定分区并点击“验证身份并解锁”即可测试。
+
+## 四平台发布：0.6.11+18
 
 移动端使用已保存 BitLocker 凭据前必须通过系统人脸、指纹或设备锁屏密码验证；取消、认证不可用或旧原生组件均不会跳过验证。视频预览改为根据实际播放失败事件显示错误，避免可恢复的解码诊断遮挡正常播放。
 

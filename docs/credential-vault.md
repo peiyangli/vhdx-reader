@@ -26,25 +26,26 @@ Rust 通过 libbde 读取未解锁卷的 Volume GUID 和密钥保护器 GUID 列
 
 “清除全部”清除本应用凭据库；不会删除系统中其他应用的凭据。系统卸载行为不作为删除保证，尤其 Apple Keychain 可能保留记录；需要删除时应使用管理功能。Apple Team / bundle 身份改变后不承诺读取旧记录。自动解锁不替代系统文件授权，外置 SSD 重新接入后仍可能需要再次选择文件。
 
-## 移动端身份验证
+## 系统身份验证
 
-Android 和 iOS/iPadOS 每次使用已保存信息解锁（包括打开镜像时的自动尝试）均先调用系统身份验证。现有记录同样受保护，无需删除后重存。取消、超时、设备未设置锁屏凭据或认证服务不可用时不执行已保存密码解锁、不删除记录、不自动循环弹窗；仍可手动输入 BitLocker 密码。主动锁定后再次使用保存信息必须重新验证。
+Android、iOS/iPadOS、Windows 和 macOS 每次使用已保存信息解锁（包括打开镜像时的自动尝试）均先调用系统身份验证。现有记录同样受保护，无需删除后重存。取消、超时、设备未设置锁屏凭据或认证服务不可用时不执行已保存密码解锁、不删除记录、不自动循环弹窗；仍可手动输入 BitLocker 密码。主动锁定后再次使用保存信息必须重新验证。
 
 - iOS/iPadOS：每次创建新的 LocalAuthentication LAContext，使用 deviceOwnerAuthentication，支持 Face ID、Touch ID 或设备密码；不复用上次认证。声明 Face ID 用途。
 - Android 11/API 30 及以上：系统 BiometricPrompt，允许强生物识别（设备支持的指纹/人脸）或设备 PIN/密码/图案；不满足强生物识别要求的人脸可改用设备凭据。
 - Android 7–10/API 24–29：使用系统锁屏 PIN/密码/图案确认界面。
-- Windows/macOS 保持原有自动解锁行为。
+- Windows：使用绑定当前桌面窗口的 Windows Hello 验证，允许系统已配置的 PIN、指纹或人脸。仅接受系统返回 Verified；取消、未配置、策略禁用、窗口销毁或超时均不解锁。该桌面互操作接口要求 Windows 11（build 22000）及以上；不支持时保留手动输入 BitLocker 密码。
+- macOS：每次新建 LAContext，通过 deviceOwnerAuthentication 使用 Touch ID 或当前用户登录密码，不复用先前认证。
 
-验证在 Rust 获取可用于解锁的保存凭据入口强制执行，由原生系统回调返回结果，不接受 Flutter 传入“已认证”标记。跨镜像同时请求时仅允许一个验证流程；认证等待最多 120 秒。iOS 未注册原生验证器时拒绝已保存密码解锁。移动端 UI 检查原生组件的认证能力声明，旧组件不支持时禁用保存与自动解锁，避免仅更新界面后绕过验证。
+验证在 Rust 获取可用于解锁的保存凭据入口强制执行，由原生系统回调返回结果，不接受 Flutter 传入“已认证”标记。跨镜像同时请求时仅允许一个验证流程；认证等待最多 120 秒。iOS/Windows/macOS 未注册原生验证器时拒绝已保存密码解锁。UI 检查原生组件的认证能力声明，旧组件不支持时禁用保存与自动解锁，避免仅更新界面后绕过验证。
 
-这层保护控制本应用使用已保存密码的操作；现有 Keychain/Keystore 加密格式不变，未改为需要生物认证才能解密的独立密钥。状态查询和管理列表仍由原生层读取加密库后只返回元数据。它不替代系统存储保护，也不自动锁定已经打开的浏览会话；需要停止访问时仍需主动锁定或关闭镜像。应用、Android JNI 库与 iOS 原生库需一起更新。
+这层保护控制本应用使用已保存密码的操作；现有 Keychain/Keystore 加密格式不变，未改为需要生物认证才能解密的独立密钥。状态查询和管理列表仍由原生层读取加密库后只返回元数据。它不替代系统存储保护，也不自动锁定已经打开的浏览会话；需要停止访问时仍需主动锁定或关闭镜像。应用与对应平台原生库需一起更新。桌面验证器在 Flutter 启动前注册到同一 Rust 库；界面不接收或传递“验证通过”标记。
 
-系统 API 依据：[Android 生物识别](https://developer.android.com/identity/sign-in/biometric-auth)、[Apple 设备所有者认证](https://developer.apple.com/documentation/localauthentication/lapolicy/deviceownerauthentication)。
+系统 API 依据：[Windows 桌面验证](https://learn.microsoft.com/en-us/windows/win32/api/userconsentverifierinterop/nf-userconsentverifierinterop-iuserconsentverifierinterop-requestverificationforwindowasync)、[Android 生物识别](https://developer.android.com/identity/sign-in/biometric-auth)、[Apple 设备所有者认证](https://developer.apple.com/documentation/localauthentication/lapolicy/deviceownerauthentication)。
 
 ## 验证入口
 
 - `app/test/reader_test.dart`：默认不记住、自动尝试一次、主动锁定、删除管理、失败回退及保存失败仍可浏览。
-- 移动端真实安全存储回归现在需要在设备上完成系统身份验证；不能将无人值守测试停在认证弹窗视为通过。
+- 各平台真实安全存储回归现在需要在设备上完成系统身份验证；不能将无人值守测试停在认证弹窗视为通过。
 - `app/integration_test/vault_test.dart`：真实系统安全存储、成功后保存、错误密码不覆盖、重建读取实例、改名副本、多个镜像、删除后无法再自动解锁。
 - `app/integration_test/android_test.dart`：真实 Keystore + 文档描述符路径。
 - `app/ios/RunnerTests/RunnerTests.swift` 的 `testSavedCredentialSurvivesContextRecreation`：真机钥匙串回归，仅操作测试新建的记录，不卸载应用；若样本已被用户记住则跳过。

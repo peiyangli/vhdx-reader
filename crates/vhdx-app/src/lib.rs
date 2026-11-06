@@ -631,7 +631,7 @@ impl State {
                                 "设备安全存储已锁定，请解锁设备后重试，或手动输入密码。"
                             }
                             "vault_auth_cancelled" => "身份验证未完成，可重试或手动输入 BitLocker 密码。",
-                            "vault_auth_unavailable" => "无法进行身份验证，请先设置设备锁屏密码，或手动输入 BitLocker 密码。",
+                            "vault_auth_unavailable" => "无法进行系统身份验证，请检查系统登录验证设置，或手动输入 BitLocker 密码。",
                             "vault_auth_busy" => "其他解锁操作正在验证身份，请完成后重试。",
                             "vault_missing" => "此卷没有已保存的解锁信息，请手动输入。",
                             "vault_corrupt" => {

@@ -55,36 +55,48 @@ class FakeBackend implements ReaderBackend {
 }
 
 void main() {
-  testWidgets(
-    'old mobile native library cannot silently bypass device authentication',
-    (tester) async {
-      final backend = VaultBackend()
-        ..saved = true
-        ..supportsDeviceAuthentication = false;
-      await tester.pumpWidget(
-        ReaderApp(
-          backend: backend,
-          initialImage: 'saved.vhdx',
-          platform: TargetPlatform.android,
-        ),
-      );
-      await tester.pumpAndSettle();
-      expect(backend.ops.where((op) => op == 'unlock_saved'), isEmpty);
-      expect(find.byKey(const Key('unlock-saved')), findsNothing);
-      expect(
-        tester
-            .widget<CheckboxListTile>(
-              find.byKey(const Key('remember-credential')),
-            )
-            .onChanged,
-        isNull,
-      );
-      expect(find.textContaining('读取组件尚不支持身份验证'), findsOneWidget);
-      expect(find.byKey(const Key('unlock-secret')), findsOneWidget);
-    },
-  );
+  for (final platform in [
+    TargetPlatform.android,
+    TargetPlatform.iOS,
+    TargetPlatform.windows,
+    TargetPlatform.macOS,
+  ]) {
+    testWidgets(
+      '$platform old native library cannot silently bypass device authentication',
+      (tester) async {
+        final backend = VaultBackend()
+          ..saved = true
+          ..supportsDeviceAuthentication = false;
+        await tester.pumpWidget(
+          ReaderApp(
+            backend: backend,
+            initialImage: 'saved.vhdx',
+            platform: platform,
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(backend.ops.where((op) => op == 'unlock_saved'), isEmpty);
+        expect(find.byKey(const Key('unlock-saved')), findsNothing);
+        expect(
+          tester
+              .widget<CheckboxListTile>(
+                find.byKey(const Key('remember-credential')),
+              )
+              .onChanged,
+          isNull,
+        );
+        expect(find.textContaining('读取组件尚不支持身份验证'), findsOneWidget);
+        expect(find.byKey(const Key('unlock-secret')), findsOneWidget);
+      },
+    );
+  }
 
-  for (final platform in [TargetPlatform.android, TargetPlatform.iOS]) {
+  for (final platform in [
+    TargetPlatform.android,
+    TargetPlatform.iOS,
+    TargetPlatform.windows,
+    TargetPlatform.macOS,
+  ]) {
     for (final code in [
       'vault_auth_cancelled',
       'vault_auth_unavailable',

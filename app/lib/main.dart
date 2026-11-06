@@ -521,9 +521,16 @@ class _ReaderHomeState extends State<ReaderHome> {
   bool _descending = false;
   String _mode = 'password';
   String? _credentialFile;
-  bool get _mobileCredentialProtection =>
+  bool get _credentialProtectionRequired =>
       widget.platform == TargetPlatform.android ||
-      widget.platform == TargetPlatform.iOS;
+      widget.platform == TargetPlatform.iOS ||
+      widget.platform == TargetPlatform.windows ||
+      widget.platform == TargetPlatform.macOS;
+  String get _credentialVerificationHint => switch (widget.platform) {
+    TargetPlatform.windows => '每次使用需通过 Windows Hello PIN、指纹或人脸验证。',
+    TargetPlatform.macOS => '每次使用需通过 Touch ID 或 Mac 登录密码验证。',
+    _ => '每次使用需通过系统人脸、指纹或锁屏密码验证。',
+  };
   bool _remember = false;
   bool _vaultAvailable = false;
   bool _savedCredential = false;
@@ -689,7 +696,7 @@ class _ReaderHomeState extends State<ReaderHome> {
         });
         if (!mounted) return;
         final protectionMissing =
-            _mobileCredentialProtection &&
+            _credentialProtectionRequired &&
             status['available'] == true &&
             status['authentication_required'] != true;
         setState(() {
@@ -1192,7 +1199,7 @@ class _ReaderHomeState extends State<ReaderHome> {
                     ? null
                     : (value) => setState(() => _remember = value ?? false),
                 title: Text(
-                  _mobileCredentialProtection
+                  _credentialProtectionRequired
                       ? '在此设备记住，验证身份后解锁'
                       : '在此设备记住，下次自动解锁',
                   style: const TextStyle(fontSize: 13),
@@ -1200,8 +1207,8 @@ class _ReaderHomeState extends State<ReaderHome> {
                 subtitle: Text(
                   !_vaultAvailable
                       ? '此设备的安全存储或卷身份暂不可用。'
-                      : _mobileCredentialProtection
-                      ? '仅在解锁成功后保存；每次使用需通过系统人脸、指纹或锁屏密码验证。'
+                      : _credentialProtectionRequired
+                      ? '仅在解锁成功后保存；$_credentialVerificationHint'
                       : '仅在解锁成功后保存到设备安全存储。',
                   style: const TextStyle(fontSize: 11),
                 ),
@@ -1212,13 +1219,13 @@ class _ReaderHomeState extends State<ReaderHome> {
                   onPressed: _busy
                       ? null
                       : () => _run(
-                          _mobileCredentialProtection
+                          _credentialProtectionRequired
                               ? '请完成系统身份验证…'
                               : '正在自动解锁…',
                           _unlockSaved,
                         ),
                   child: Text(
-                    _mobileCredentialProtection ? '验证身份并解锁' : '使用已保存信息解锁',
+                    _credentialProtectionRequired ? '验证身份并解锁' : '使用已保存信息解锁',
                   ),
                 ),
               if (_vaultNote != null)
