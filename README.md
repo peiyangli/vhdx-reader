@@ -2,7 +2,13 @@
 
 外置 SSD 上的 VHDX / BitLocker / NTFS 只读浏览器。包含 Rust 核心、Windows / Android / macOS / iOS/iPadOS Flutter 界面，以及 Windows / Linux 命令行工具。已接入文本、图片、PDF 内嵌预览和视频播放；独立音频界面仍待实现。
 
-## 当前 Windows 测试版：0.6.18+25
+## 当前 Windows 测试版：0.6.19+26
+
+Windows BitLocker 读取改用固定版本 OpenSSL EVP 后端，保留原后端构建选项。已有加密视频在本机的完整读取耗时约减半；扇区、整文件哈希及随机读取验证通过。详细测试条件和结果见 [读取性能记录](docs/read-performance.md)。这不是 iPad/外置 SSD 实测，也不代表播放帧率提升一倍。媒体缓冲区复用未测得稳定收益，本版不纳入。
+
+Windows 更新包位于 `artifacts/0.6.19/`；其他平台解密后端和现有 0.6.16 安装包未更新。版本目录的 `manifest.json` 记录验证范围。
+
+## 0.6.18+25
 
 修复桌面视频失焦时被暂停、滑动控件被禁用的问题。失去焦点和最小化继续播放；关闭到托盘暂停，恢复窗口后由用户继续播放。移动端后台暂停行为保持不变。
 

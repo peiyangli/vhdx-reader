@@ -53,4 +53,5 @@ foreach ($item in $items) {
         $lines.Add("target_link_libraries($name PRIVATE libbfio)")
     }
 }
+$lines.Add('include("${CMAKE_CURRENT_LIST_DIR}/../scripts/native-crypto.cmake")')
 [IO.File]::WriteAllLines("$root\.native\CMakeLists.txt", $lines, [Text.UTF8Encoding]::new($false))

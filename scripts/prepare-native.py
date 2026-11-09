@@ -64,4 +64,5 @@ for item in manifest:
         bfio = manifest[0]
         cmake += [f'target_include_directories({name} PRIVATE "${{CMAKE_CURRENT_LIST_DIR}}/src/libbfio-{bfio["version"]}/include")', f'target_link_libraries({name} PRIVATE libbfio)']
     print(f'Verified {name} {version}')
+cmake += ['include("${CMAKE_CURRENT_LIST_DIR}/../scripts/native-crypto.cmake")']
 (ROOT / '.native/CMakeLists.txt').write_text('\n'.join(cmake) + '\n')

@@ -1,4 +1,4 @@
-param([switch]$Offline, [switch]$SkipNative, [string]$FlutterPath, [switch]$Preview, [string]$PackageDirectory, [string]$ArchivePath, [string]$NativeArtifactDirectory)
+param([switch]$Offline, [switch]$SkipNative, [string]$FlutterPath, [switch]$Preview, [string]$PackageDirectory, [string]$ArchivePath, [string]$NativeArtifactDirectory, [ValidateSet("openssl","builtin")][string]$NativeCryptoBackend = "openssl")
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\file-sha256.ps1"
 $root = Split-Path $PSScriptRoot -Parent
@@ -10,7 +10,7 @@ if (-not $FlutterPath) {
 $env:PUB_CACHE = "$root\.tools\pub-cache"
 $env:FLUTTER_SUPPRESS_ANALYTICS = 'true'
 $env:CI = 'true'
-& "$PSScriptRoot\build-windows.ps1" -Offline:$Offline -SkipNative:$SkipNative -ArtifactDirectory $NativeArtifactDirectory
+& "$PSScriptRoot\build-windows.ps1" -Offline:$Offline -SkipNative:$SkipNative -ArtifactDirectory $NativeArtifactDirectory -NativeCryptoBackend $NativeCryptoBackend
 Set-Location "$root\app"
 $pubArgs = @('pub','get')
 if ($Offline) { $pubArgs += '--offline' }

@@ -9,6 +9,8 @@
 | [libbde](https://github.com/libyal/libbde) | 20260916 | LGPL-3.0-or-later / alpha |
 | [libfsntfs](https://github.com/libyal/libfsntfs) | 20260827 | LGPL-3.0-or-later / experimental |
 
+Windows 从 0.6.19 起将 OpenSSL 3.5.9 的静态 libcrypto 链接到 libbde，使用上游 EVP 无填充接口及 CPU 指令分派；无需安装额外的 OpenSSL DLL。官方归档与 SHA-256 固定在 `scripts/openssl-source.json`，构建入口为 `scripts/build-openssl-windows.ps1`，采用 Apache-2.0 许可证，原始 LICENSE.txt 和 AUTHORS.md 随包保存在 `licenses/openssl/`。`licenses/native-build.json` 记录实际后端；构建时可通过 `-NativeCryptoBackend builtin` 使用原后端作对照。本次没有切换 Android/Apple 的解密后端。
+
 这些发行归档内含其他 libyal 支持库及各自的版权声明。Windows 脚本将它们编译进相应 DLL，保留原始源码，不对上游实现打补丁；`libbfio` 以独立 DLL 供其他库使用。Linux 使用上游 configure/make。
 
 便携目录复制各库的 COPYING* 和 AUTHORS。分享二进制前，还需要按所用许可证提供相应源码、构建脚本和通知；仅附许可证或上游网址不等同于已经完成所有发布义务。保留 `.native/downloads` 中的确切原始归档用于准备源码包，不把其中的构建缓存、测试镜像或密钥混入公开源码。
