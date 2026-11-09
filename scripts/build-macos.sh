@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 artifact_dir="${VHDX_ARTIFACT_DIR:-$repo_root/artifacts}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
 export MACOSX_DEPLOYMENT_TARGET=12.0
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.96.1}"
 export PUB_CACHE="$repo_root/.tools/pub-cache-macos"
 export COCOAPODS_DISABLE_STATS=true
 # Rust 1.96 stripping produces misaligned LINKEDIT data rejected by macOS 27.
@@ -51,6 +52,7 @@ for name in ['LICENSE', 'THIRD_PARTY.md', 'scripts/native-sources.json', 'script
     source = root / name
     shutil.copyfile(source, target / source.name)
 PY
+python3 "$repo_root/scripts/stage-openssl-license.py" "$stage/licenses" "$repo_root/.native/install-macos-$arch"
 printf "ARCHS = %s\nVHDX_NATIVE_ARCH = %s\n" "$arch" "$arch" > "$repo_root/app/macos/Runner/Configs/NativeBuild.xcconfig"
 cd "$repo_root/app"
 "$FLUTTER" pub get

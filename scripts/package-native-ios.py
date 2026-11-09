@@ -50,3 +50,7 @@ for item in json.loads((root / 'scripts/native-sources.json').read_text()):
         shutil.copyfile(path, destination / path.name)
 for name in ['LICENSE', 'THIRD_PARTY.md', 'scripts/native-sources.json', 'scripts/apple-dependencies.json']:
     shutil.copyfile(root / name, notices / pathlib.Path(name).name)
+
+subprocess.run(["python3", str(root / "scripts/stage-openssl-license.py"), str(notices),
+                str(root / ".native/install-iphoneos-arm64"),
+                str(root / ".native/install-iphonesimulator-arm64")], check=True)

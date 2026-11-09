@@ -23,7 +23,7 @@ while kill -0 "$test_pid" 2>/dev/null; do
   container="$(xcrun simctl get_app_container "$device" org.vhdxreader.reader data 2>/dev/null || true)"
   fixtures="$container/Documents/vhdx-validation"
   if [[ -n "$container" && -f "$fixtures/.complete" ]]; then
-    destination="$repo_root/artifacts/ios-validation/$label"
+    destination="${VHDX_TEST_OUTPUT:-$repo_root/.native/ios-validation}/$label"
     mkdir -p "$destination"
     for png in "$fixtures/"*.png; do
       [[ ! -f "$png" ]] || cp "$png" "$destination/"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check the signed app, native CPU slices and absence of host-only dependencies."""
 import ctypes
+import json
 import pathlib
 import plistlib
 import subprocess
@@ -35,6 +36,11 @@ for name in ('app-sandbox', 'files.user-selected.read-write', 'network.client', 
         raise SystemExit(f'Missing entitlement: {name}')
 if not (contents / 'Resources/licenses/THIRD_PARTY.md').is_file():
     raise SystemExit('Missing native dependency notice')
+licenses = contents / 'Resources/licenses'
+crypto = json.loads((pathlib.Path(__file__).resolve().parent / 'openssl-source.json').read_text())
+backend = json.loads((licenses / 'native-crypto.json').read_text())
+assert backend.get('backend') == 'openssl-evp' and backend.get('sha256') == crypto['sha256'], 'Crypto backend mismatch'
+assert (licenses / 'openssl/LICENSE.txt').is_file(), 'OpenSSL notice missing'
 for file in contents.rglob('*'):
     if file.suffix.lower() in ('.vhdx', '.avhdx', '.bek') or file.name.lower() == 'password.txt':
         raise SystemExit(f'Private fixture in app bundle: {file.name}')

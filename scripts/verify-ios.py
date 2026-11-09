@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check bundled iOS framework closure and platform before archiving an app."""
+import json
 import pathlib
 import plistlib
 import subprocess
@@ -50,6 +51,11 @@ for binary in binaries:
         assert any(p.is_file() and p.resolve().is_relative_to(app) for p in candidates), (binary.name, dep)
 if platform == 'IOSSIMULATOR':
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+licenses = app / 'Licenses'
+crypto = json.loads((pathlib.Path(__file__).resolve().parent / 'openssl-source.json').read_text())
+backend = json.loads((licenses / 'native-crypto.json').read_text())
+assert backend.get('backend') == 'openssl-evp' and backend.get('sha256') == crypto['sha256'], 'Crypto backend mismatch'
+assert (licenses / 'openssl/LICENSE.txt').is_file(), 'OpenSSL notice missing'
 for file in app.rglob('*'):
     assert file.suffix.lower() not in ('.vhdx', '.bek', '.avhdx'), file
     assert file.name.lower() != 'password.txt', file

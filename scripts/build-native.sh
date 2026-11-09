@@ -2,6 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 python3 "$repo_root/scripts/prepare-native.py"
+bash "$repo_root/scripts/build-openssl.sh" linux-x86_64
 build_root="${VHDX_BUILD_ROOT:-$repo_root/.native/build-linux}"
 prefix="${VHDX_PREFIX:-$repo_root/.native/install-linux}"
 mkdir -p "$build_root" "$prefix"
@@ -13,12 +14,15 @@ while read -r name version; do
     fi
     (
         cd "$build_root/$name"
-        extra=()
+        extra=(--disable-nls --disable-python --with-pthread=no)
+        crypto=no
+        [[ "$name" != libbde ]] || crypto="$repo_root/.native/install-openssl-linux-x86_64"
         if [[ "$name" != libbfio ]]; then extra+=("--with-libbfio=$prefix"); fi
-        ./configure --prefix="$prefix" --disable-static --enable-shared "${extra[@]}" > configure.log 2>&1
+        ./configure --prefix="$prefix" --disable-static --enable-shared --with-openssl="$crypto" "${extra[@]}" > configure.log 2>&1
         make -j"${VHDX_BUILD_JOBS:-4}" > build.log 2>&1
         make install > install.log 2>&1
     )
+    if [[ "$name" == libbde ]]; then bash "$repo_root/scripts/record-native-crypto.sh" "$build_root/$name/common/config.h" "$prefix" linux-x86_64; fi
     echo "Built $name $version"
 done < <(python3 -c 'import json,sys; [print(x["name"],x["version"]) for x in json.load(open(sys.argv[1]))]' "$repo_root/scripts/native-sources.json")
 echo "Native library directory: $prefix/lib"

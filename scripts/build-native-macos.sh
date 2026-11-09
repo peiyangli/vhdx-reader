@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 arch="$(uname -m)"
 case "$arch" in arm64|x86_64) ;; *) echo "Unsupported CPU: $arch" >&2; exit 1 ;; esac
 python3 "$repo_root/scripts/prepare-native.py"
+bash "$repo_root/scripts/build-openssl.sh" "macos-$arch"
 prefix="$repo_root/.native/install-macos-$arch"
 build_root="$repo_root/.native/build-macos-$arch"
 export MACOSX_DEPLOYMENT_TARGET=12.0
@@ -23,12 +24,15 @@ while read -r name version; do
         # Upstream archives contain generated Linux headers: configure in a build copy.
         cd "$build_root/$name"
         extra=(--disable-nls)
+        crypto=no
+        [[ "$name" != libbde ]] || crypto="$repo_root/.native/install-openssl-macos-$arch"
         if [[ "$name" != libbfio ]]; then extra+=("--with-libbfio=$prefix"); fi
         ./configure --prefix="$prefix" --disable-static --enable-shared \
-            --disable-python --with-pthread=no --with-openssl=no "${extra[@]}" > configure.log 2>&1
+            --disable-python --with-pthread=no --with-openssl="$crypto" "${extra[@]}" > configure.log 2>&1
         make -j"${VHDX_BUILD_JOBS:-4}" > build.log 2>&1
         make install > install.log 2>&1
     )
+    if [[ "$name" == libbde ]]; then bash "$repo_root/scripts/record-native-crypto.sh" "$build_root/$name/common/config.h" "$prefix" "macos-$arch"; fi
     echo "Built macOS $arch $name $version"
 done < <(python3 - "$repo_root/scripts/native-sources.json" <<'PY'
 import json, sys

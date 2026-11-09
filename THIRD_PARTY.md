@@ -9,7 +9,7 @@
 | [libbde](https://github.com/libyal/libbde) | 20260916 | LGPL-3.0-or-later / alpha |
 | [libfsntfs](https://github.com/libyal/libfsntfs) | 20260827 | LGPL-3.0-or-later / experimental |
 
-Windows 从 0.6.19 起将 OpenSSL 3.5.9 的静态 libcrypto 链接到 libbde，使用上游 EVP 无填充接口及 CPU 指令分派；无需安装额外的 OpenSSL DLL。官方归档与 SHA-256 固定在 `scripts/openssl-source.json`，构建入口为 `scripts/build-openssl-windows.ps1`，采用 Apache-2.0 许可证，原始 LICENSE.txt 和 AUTHORS.md 随包保存在 `licenses/openssl/`。`licenses/native-build.json` 记录实际后端；构建时可通过 `-NativeCryptoBackend builtin` 使用原后端作对照。本次没有切换 Android/Apple 的解密后端。
+Windows 从 0.6.19 起，Android、Apple 和 Linux 从 0.6.20 起将 OpenSSL 3.5.9 的静态 libcrypto 链接到 libbde，使用上游 EVP 无填充接口及 CPU 指令分派；无需安装额外的 OpenSSL DLL。官方归档与 SHA-256 固定在 `scripts/openssl-source.json`，构建入口为 `scripts/build-openssl-windows.ps1` 和 `scripts/build-openssl.sh`，采用 Apache-2.0 许可证，原始 LICENSE.txt 和 AUTHORS.md 随包保存在 `licenses/openssl/`。`licenses/native-build.json`（Windows）或 `native-crypto.json`（其他平台）记录实际后端；构建时可通过 `-NativeCryptoBackend builtin` 使用原后端作对照。Apple 各 SDK 切片和 Android API 24 ARM64 分别编译静态 libcrypto；不附加动态 OpenSSL 库，也不修改上游源码。
 
 这些发行归档内含其他 libyal 支持库及各自的版权声明。Windows 脚本将它们编译进相应 DLL，保留原始源码，不对上游实现打补丁；`libbfio` 以独立 DLL 供其他库使用。Linux 使用上游 configure/make。
 
@@ -25,7 +25,7 @@ libmpv 的 LGPL/GPL 文本和 Copyright 来自对应 mpv 提交，保存在 `thi
 
 生成测试视频所用的 FFmpeg 命令行工具仅放在本地 `.tools/`，不捆绑到应用。测试镜像和视频不进入便携包。许可证信息以固定版本自带文件为准。
 
-Android ARM64 使用相同的 libyal 源码，NDK 27.3.13750724 / configure 构建独立 `.so`；禁用外部 pthread/OpenSSL 链接，使用随附的加密实现，并去掉构建主机 RUNPATH。PDFium Android 同为 chromium/8125，固定归档哈希见 `scripts/prepare-pdfium-android.ps1`，许可证和构建参数随 APK 保存。Android Flutter 包的通知由 Flutter 纳入资产。
+Android ARM64 使用相同的 libyal 源码，NDK 27.3.13750724 / configure 构建独立 `.so`；禁用外部 pthread，libbde 静态链接固定 OpenSSL EVP 后端，并去掉构建主机 RUNPATH。PDFium Android 同为 chromium/8125，固定归档哈希见 `scripts/prepare-pdfium-android.ps1`，许可证和构建参数随 APK 保存。Android Flutter 包的通知由 Flutter 纳入资产。
 
 Android 视频包装层 `media_kit_libs_android_video` 1.3.8 为 MIT，使用 `media-kit/libmpv-android-video-build` **v1.1.7** 原生归档，固定 SHA-256 / 包内 MD5 见 `scripts/media-android.json`。APK 只打包 ARM64。与 Windows 原生媒体包一样，包装层 MIT 不覆盖 libmpv/FFmpeg 等传递依赖；原生归档缺少完整对应源码与通知，公开二进制发布前仍需核对该版本的构建配置及许可义务。当前 APK 为本地开发测试产物。
 

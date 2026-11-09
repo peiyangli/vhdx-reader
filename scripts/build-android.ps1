@@ -14,6 +14,7 @@ $root = Split-Path $PSScriptRoot -Parent
 if (-not $ArtifactDirectory) { $ArtifactDirectory = "$root\artifacts" }
 $ndk = "$AndroidSdk\ndk\27.3.13750724"
 if (-not (Test-Path "$ndk\source.properties")) { throw 'Install Android NDK 27.3.13750724 first' }
+$env:VHDX_OFFLINE = if ($Offline) { '1' } else { '0' }
 $env:JAVA_HOME = $JavaHome
 $env:ANDROID_HOME = $AndroidSdk
 $env:PUB_CACHE = "$root\.tools\pub-cache"
@@ -59,6 +60,9 @@ if (-not $SkipNative) {
     & "$MsysRoot\usr\bin\bash.exe" --login "$posixRoot/scripts/build-native-android.sh"
     if ($LASTEXITCODE -ne 0) { throw 'Android C library build failed; inspect .native/build-android logs' }
 }
+$crypto = Get-Content "$PSScriptRoot\openssl-source.json" -Raw | ConvertFrom-Json
+$backend = Get-Content "$root\.native\android\arm64-v8a\native-crypto.json" -Raw | ConvertFrom-Json
+if ($backend.backend -ne 'openssl-evp' -or $backend.sha256 -ne $crypto.sha256 -or $backend.version -ne $crypto.version) { throw 'Native crypto backend mismatch; rebuild without -SkipNative' }
 $env:CARGO_TARGET_DIR = "$root\target\android"
 $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "$ndk\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android24-clang.cmd"
 $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = '-C link-arg=-Wl,-z,max-page-size=16384'
@@ -79,6 +83,9 @@ foreach ($item in (Get-Content "$PSScriptRoot\native-sources.json" -Raw | Conver
     [IO.Directory]::CreateDirectory($dir) | Out-Null
     Copy-Item "$root\.native\src\$($item.name)-$($item.version)\COPYING*","$root\.native\src\$($item.name)-$($item.version)\AUTHORS" $dir -Force
 }
+[IO.Directory]::CreateDirectory("$licenses\openssl") | Out-Null
+Copy-Item "$root\.native\src\openssl-$($crypto.version)\LICENSE.txt","$root\.native\src\openssl-$($crypto.version)\AUTHORS.md","$PSScriptRoot\openssl-source.json" "$licenses\openssl" -Force
+Copy-Item "$root\.native\android\arm64-v8a\native-crypto.json" $licenses -Force
 Copy-Item "$root\THIRD_PARTY.md","$PSScriptRoot\native-sources.json","$PSScriptRoot\media-android.json" $licenses -Force
 & "$PSScriptRoot\prepare-pdfium-android.ps1" -Offline:$Offline
 Copy-Item "$root\third_party\rust" "$licenses\rust" -Recurse -Force

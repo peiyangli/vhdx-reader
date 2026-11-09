@@ -55,6 +55,11 @@ try {
             }
         }
     } finally { $media.Dispose() }
+    $crypto = Get-Content "$PSScriptRoot\openssl-source.json" -Raw | ConvertFrom-Json
+    $backend = [Text.Encoding]::UTF8.GetString((Read-Entry $zip 'assets/licenses/native-crypto.json')) | ConvertFrom-Json
+    if ($backend.backend -ne 'openssl-evp' -or $backend.sha256 -ne $crypto.sha256) { throw 'Packaged crypto backend mismatch' }
+    if ($null -eq $zip.GetEntry('assets/licenses/openssl/LICENSE.txt')) { throw 'Missing OpenSSL license' }
+    if (@($libs | Where-Object { $_.FullName -match '/lib(crypto|ssl).*\.so$' }).Count -gt 0) { throw 'Unexpected dynamic OpenSSL dependency' }
     if ($null -eq $zip.GetEntry('assets/licenses/THIRD_PARTY.md')) { throw 'Missing dependency notice' }
     if (@($zip.Entries | Where-Object { $_.FullName -match '\.(vhdx|avhdx|bek)$|(^|/)(password\.txt|fixtures/)' }).Count -gt 0) {
         throw 'APK contains private test data'

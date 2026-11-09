@@ -12,9 +12,9 @@ launch_pid=''
 fixtures=''
 cleanup() {
     if [[ -n "$fixtures" && -d "$fixtures" ]]; then
-        mkdir -p "$repo_root/artifacts/macos-validation"
+        mkdir -p "${VHDX_TEST_OUTPUT:-$repo_root/.native/macos-validation}"
         for png in "$fixtures/"*.png; do
-            [[ ! -f "$png" ]] || cp "$png" "$repo_root/artifacts/macos-validation/"
+            [[ ! -f "$png" ]] || cp "$png" "${VHDX_TEST_OUTPUT:-$repo_root/.native/macos-validation}/"
         done
     fi
     if [[ -n "$launch_pid" ]]; then kill "$launch_pid" 2>/dev/null || true; fi

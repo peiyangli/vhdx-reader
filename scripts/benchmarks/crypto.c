@@ -45,12 +45,26 @@ static void known_answer(void) {
     if (memcmp(out, plain, 16)) { fputs("CBC known answer mismatch\n", stderr); exit(1); }
     check(libcaes_context_free(&ctx, &error));
 }
+/* libbde configure's runtime probe cannot run when cross-compiling. */
+static void duplicate_xts_keys(FILE *vectors) {
+    unsigned char key[32] = {0}, iv[16] = {0}, input[512] = {0}, out[512];
+    int bits;
+    for (bits = 128; bits <= 256; bits += 128) {
+        libcaes_tweaked_context_t *ctx = NULL;
+        check(libcaes_tweaked_context_initialize(&ctx, &error));
+        check(libcaes_tweaked_context_set_keys(ctx, 0, key, bits, key, bits, &error));
+        check(libcaes_crypt_xts(ctx, 0, iv, 16, input, sizeof(input), out, sizeof(out), &error));
+        if (vectors && fwrite(out, 1, sizeof(out), vectors) != sizeof(out)) exit(1);
+        check(libcaes_tweaked_context_free(&ctx, &error));
+    }
+}
 int main(int argc, char **argv) {
     unsigned char key[32], tweak_key[32], iv[16] = {0}, plain[4096], cipher[4096], out[4096];
     FILE *vectors = argc == 2 ? fopen(argv[1], "wb") : NULL;
     int xts, bits, size, round, i;
     if (argc == 2 && !vectors) return 1;
     known_answer();
+    duplicate_xts_keys(vectors);
     for (i = 0; i < 32; i++) { key[i] = (unsigned char)i; tweak_key[i] = (unsigned char)(i + 73); }
     for (i = 0; i < 4096; i++) plain[i] = (unsigned char)(i * 13 + i / 512);
     puts("mode,key_bits,sector_bytes,round,ms,mib_per_second");

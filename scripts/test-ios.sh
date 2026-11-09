@@ -7,7 +7,8 @@ export PUB_CACHE="$repo_root/.tools/pub-cache-macos"
 FLUTTER="${FLUTTER:-$repo_root/.tools/flutter-macos/bin/flutter}"
 cd "$repo_root/app"
 "$FLUTTER" build ios --simulator --debug
-mkdir -p "$repo_root/artifacts/ios-validation"
+export VHDX_TEST_OUTPUT="${VHDX_TEST_OUTPUT:-$repo_root/.native/ios-validation}"
+mkdir -p "$VHDX_TEST_OUTPUT"
 runtime="$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; r=[r for r in json.load(sys.stdin)["runtimes"] if r["isAvailable"] and r["name"].startswith("iOS")]; print(sorted(r,key=lambda x:tuple(map(int,x["version"].split("."))))[-1]["identifier"])')"
 device=''
 cleanup() {
@@ -26,6 +27,7 @@ for family in ${VHDX_TEST_FAMILIES:-iPhone iPad}; do
   device="$(xcrun simctl create "VHDX Reader $family Validation" "$device_type" "$runtime")"
   xcrun simctl boot "$device"
   xcrun simctl bootstatus "$device" -b
+  bash "$repo_root/scripts/test-crypto-apple.sh" iphonesimulator "$device"
   bash "$repo_root/scripts/run-ios-integration.sh" "$device" "$family"
   "$FLUTTER" build ios --simulator --debug
   xcodebuild -quiet test -workspace ios/Runner.xcworkspace -scheme Runner -configuration Debug \

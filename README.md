@@ -2,7 +2,15 @@
 
 外置 SSD 上的 VHDX / BitLocker / NTFS 只读浏览器。包含 Rust 核心、Windows / Android / macOS / iOS/iPadOS Flutter 界面，以及 Windows / Linux 命令行工具。已接入文本、图片、PDF 内嵌预览和视频播放；独立音频界面仍待实现。
 
-## 当前 Windows 测试版：0.6.19+26
+## 当前各平台测试版：0.6.20+27
+
+Windows、Android ARM64、macOS ARM64、iOS/iPadOS ARM64 和 Linux x64 命令行读取核心统一使用固定版本 OpenSSL 3.5.9 EVP 无填充后端。libcrypto 静态链接到 libbde，由库选择可用 CPU 加密指令，无需额外安装 OpenSSL。读取缓存、文件格式和密码兼容性保持不变。
+
+更新包统一放在 `artifacts/0.6.20/`，测试范围及 SHA-256 见版本目录的 `manifest.json` 和 `SHA256SUMS`。Android 为开发签名包，macOS 为 ad-hoc 签名包；iOS 设备包未签名，需要有效的 Apple 签名才能安装，另提供 ARM64 模拟器包。Linux 提供命令行包。
+
+此前 Windows/Mac 的读取收益见 [性能记录](docs/read-performance.md)，不代表移动端外置 SSD 的实际速度。各平台打包时核验已选择 EVP 无填充后端，并附 OpenSSL 许可证和版本信息。
+
+## 0.6.19+26
 
 Windows BitLocker 读取改用固定版本 OpenSSL EVP 后端，保留原后端构建选项。已有加密视频在本机的完整读取耗时约减半；扇区、整文件哈希及随机读取验证通过。详细测试条件和结果见 [读取性能记录](docs/read-performance.md)。这不是 iPad/外置 SSD 实测，也不代表播放帧率提升一倍。媒体缓冲区复用未测得稳定收益，本版不纳入。
 
@@ -400,3 +408,6 @@ artifacts/           本机便携产物，禁止提交
 - 设置中可分别控制普通卷与 BitLocker 卷的本地缩略图缓存，BitLocker 默认关闭。开启后会将**未加密的缩略图**存入设备应用缓存目录；锁定后应用禁止显示，但缓存文件仍存在。关闭该开关会删除已有 BitLocker 缓存，也可使用“清空缩略图缓存”。
 - 缩略图内存预算：桌面 64 MiB、移动端 24 MiB；磁盘缓存总预算 256 MiB。锁定、关闭镜像或设备读取失效会撤销对应任务与内存缓存。无法提供可靠修改时间的文档提供程序仅在本次打开期间复用缓存。
 - 图标源文件位于 `design/`，使用 `python3 scripts/generate-icons.py`（需要 Pillow）统一生成各平台资源。
+
+
+系统身份验证集成用例需要用户在场批准系统弹窗，默认不在无人值守测试中运行。手工回归时给 Flutter 测试添加 `--dart-define=VHDX_INTERACTIVE_AUTH_TESTS=true`，并配置设备的 PIN/指纹/人脸或桌面系统身份验证。测试不会绕过产品的身份验证保护；保存凭据时拒绝错误密码、身份验证失败时不读取凭据的逻辑另有原生自动化测试覆盖。
