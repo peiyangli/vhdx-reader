@@ -19,7 +19,7 @@ for name in ('libvhdx_app', 'libbfio', 'libvhdi', 'libbde', 'libfsntfs'):
     library = contents / 'Frameworks/vhdx' / (name + '.dylib')
     subprocess.run(['lipo', '-verify_arch', arch, str(library)], check=True)
     loaded = ctypes.CDLL(str(library))
-    if name == 'libvhdx_app' and loaded.vhdx_api_version() != 7:
+    if name == 'libvhdx_app' and loaded.vhdx_api_version() != 9:
         raise SystemExit('Rust ABI mismatch')
     for line in subprocess.check_output(['otool', '-L', str(library)], text=True).splitlines()[1:]:
         dependency = line.strip().split(' (', 1)[0]

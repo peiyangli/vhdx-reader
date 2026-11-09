@@ -7,6 +7,26 @@ import 'package:vhdx_reader/platform_storage.dart';
 import 'package:vhdx_reader/thumbnails.dart';
 import 'test_configuration.dart';
 
+class ThumbnailTransportBackend extends ReaderBackend {
+  ThumbnailTransportBackend(this.inner);
+  final ReaderBackend inner;
+  final transports = <String>[];
+  @override
+  Future<Map<String, dynamic>> request(Map<String, dynamic> value) {
+    if (value['op'] == 'media_open') {
+      transports.add(value['transport'] as String? ?? 'http');
+    }
+    return inner.request(value);
+  }
+
+  @override
+  void beginOperation() => inner.beginOperation();
+  @override
+  void cancel() => inner.cancel();
+  @override
+  Future<void> dispose() => inner.dispose();
+}
+
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   testWidgets(
@@ -17,7 +37,7 @@ void main() {
           home: Scaffold(body: Text('Thumbnail integration test')),
         ),
       );
-      final backend = await NativeBackend.start();
+      final backend = ThumbnailTransportBackend(await NativeBackend.start());
       final directory = await Directory.systemTemp.createTemp(
         'vhdx-thumbnail-test-',
       );
@@ -30,6 +50,8 @@ void main() {
           'op': 'open',
           'path': Platform.isIOS
               ? '${await PlatformStorage.channel.invokeMethod<String>('testFixtureDirectory')}/media-preview.vhdx'
+              : Platform.isAndroid
+              ? 'content://org.vhdxreader.vhdx_reader.uitest.fixtures/media-preview.vhdx'
               : fixtureSetting('VHDX_MEDIA_FIXTURE')!,
         });
         await backend.request({'op': 'unlock', 'partition': 1, 'mode': 'none'});
@@ -69,6 +91,7 @@ void main() {
         );
         await pending;
         expect(thumb, isNotNull);
+        expect(backend.transports, ['native']);
         expect(thumb!.image.width, lessThanOrEqualTo(320));
         expect(thumb!.duration.inSeconds, greaterThanOrEqualTo(30));
         thumb!.dispose();

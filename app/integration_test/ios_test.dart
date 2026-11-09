@@ -1,3 +1,4 @@
+import 'thumbnails_test.dart' as thumbnails;
 import 'vault_test.dart' as vault;
 import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
@@ -92,5 +93,6 @@ Future<void> main() async {
   native.main();
   pdf.main();
   media.main();
+  thumbnails.main();
   cache.main();
 }

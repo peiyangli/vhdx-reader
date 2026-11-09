@@ -102,11 +102,55 @@ impl Image {
         cache_bytes: usize,
         ciphertext_cache_bytes: usize,
     ) -> Result<Volume> {
-        if cache_bytes < 64 * 1024 || ciphertext_cache_bytes < 64 * 1024 {
+        self.unlock_with_cache_layout(
+            index,
+            credential,
+            cache_bytes,
+            ciphertext_cache_bytes,
+            64 * 1024,
+        )
+    }
+    /// Budgets are per volume and filled on demand. The plaintext page size is
+    /// independent of the fixed 64 KiB ciphertext coalescing pages.
+    pub fn unlock_with_cache_layout(
+        &self,
+        index: u32,
+        credential: Option<&Credential>,
+        cache_bytes: usize,
+        ciphertext_cache_bytes: usize,
+        cache_page_bytes: usize,
+    ) -> Result<Volume> {
+        self.unlock_with_disk_cache(
+            index,
+            credential,
+            cache_bytes,
+            ciphertext_cache_bytes,
+            cache_page_bytes,
+            None,
+        )
+    }
+    pub fn unlock_with_disk_cache(
+        &self,
+        index: u32,
+        credential: Option<&Credential>,
+        cache_bytes: usize,
+        ciphertext_cache_bytes: usize,
+        cache_page_bytes: usize,
+        disk_cache: Option<(Rc<RefCell<crate::disk_cache::DiskCache>>, String)>,
+    ) -> Result<Volume> {
+        if !(64 * 1024..=4 * 1024 * 1024).contains(&cache_page_bytes)
+            || !cache_page_bytes.is_power_of_two()
+        {
+            return Err(Error::Invalid("unsupported cache page size".into()));
+        }
+        if cache_bytes < cache_page_bytes || ciphertext_cache_bytes < 64 * 1024 {
             return Err(Error::Invalid(
                 "cache budget must contain at least one page".into(),
             ));
         }
+        let control = disk_cache
+            .as_ref()
+            .map(|(cache, _)| cache.borrow().control.clone());
         let partition = self
             .info
             .partitions
@@ -125,11 +169,12 @@ impl Image {
                 // before crossing the VHDX/provider boundary (especially costly
                 // for external or network-backed descriptors). This separate
                 // cache contains ciphertext; plaintext has its own budget below.
-                let encrypted = Rc::new(CachedReader::new(
-                    source,
-                    64 * 1024,
-                    ciphertext_cache_bytes,
-                )?);
+                let encrypted = CachedReader::new(source, 64 * 1024, ciphertext_cache_bytes)?;
+                let encrypted = Rc::new(if let Some(control) = &control {
+                    encrypted.with_control(control.clone())
+                } else {
+                    encrypted
+                });
                 let decrypted = Decrypted::open(&self.runtime, encrypted, credential)?;
                 let method = decrypted.encryption_method;
                 (decrypted, Some(method))
@@ -143,7 +188,26 @@ impl Image {
         if crate::partition::detect_volume(source.as_ref(), 0)? != VolumeKind::Ntfs {
             return Err(Error::Unsupported("unlocked filesystem is not NTFS".into()));
         }
-        let cached = Rc::new(CachedReader::new(source, 64 * 1024, cache_bytes)?);
+        // Credential/volume checks above always read the real source first.
+        let source: Rc<dyn ReadAt> = if let Some((cache, identity)) = disk_cache {
+            Rc::new(crate::disk_cache::DiskCachedReader::new(
+                source,
+                cache,
+                format!(
+                    "{identity}:{}:{}:{}",
+                    partition.index, partition.offset, partition.length
+                ),
+                cache_page_bytes,
+            ))
+        } else {
+            source
+        };
+        let cached = CachedReader::new(source, cache_page_bytes, cache_bytes)?;
+        let cached = Rc::new(if let Some(control) = control {
+            cached.with_control(control)
+        } else {
+            cached
+        });
         let fs = Ntfs::open(&self.runtime, cached)?;
         Ok(Volume {
             fs,

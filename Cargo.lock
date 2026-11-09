@@ -476,6 +476,7 @@ dependencies = [
  "jni",
  "serde",
  "serde_json",
+ "sha2",
  "vhdx-core",
  "zeroize",
 ]

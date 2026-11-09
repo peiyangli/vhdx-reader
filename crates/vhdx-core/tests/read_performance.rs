@@ -133,3 +133,63 @@ fn paged_directory_and_reads_survive_eviction_refresh_and_errors() {
     }
     assert_eq!(file.read_at(file.len(), &mut out, &cancel).unwrap(), 0);
 }
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+#[ignore = "requires VHDX_SAMPLE_DIR, VHDX_READ_FIXTURE and VHDX_NATIVE_DIR"]
+fn configurable_cache_pages_preserve_ntfs_and_bitlocker_reads() {
+    let root = std::path::PathBuf::from(std::env::var_os("VHDX_SAMPLE_DIR").unwrap());
+    let fixture = std::path::PathBuf::from(std::env::var_os("VHDX_READ_FIXTURE").unwrap());
+    let native = std::env::var("VHDX_NATIVE_DIR").unwrap();
+    let runtime = Runtime::load(Path::new(&native)).unwrap();
+    let credential = vhdx_core::credentials::from_file(&root.join("password.txt"), false).unwrap();
+    let cancel = Cancellation::default();
+    for (path, file_path, credential) in [
+        (fixture, "/payload.bin", None),
+        (
+            root.join("bitlockervhdx.vhdx"),
+            "/$LogFile",
+            Some(&credential),
+        ),
+    ] {
+        let image =
+            Image::from_source(runtime.clone(), Rc::new(LocalFile::open(&path).unwrap())).unwrap();
+        let baseline = image.unlock(1, credential, 16 * 1024 * 1024).unwrap();
+        let file = baseline.open_file(file_path).unwrap();
+        let mut reference = zeroize::Zeroizing::new(vec![0; file.len() as usize]);
+        for (index, chunk) in reference.chunks_mut(256 * 1024).enumerate() {
+            assert_eq!(
+                file.read_at((index * 256 * 1024) as u64, chunk, &cancel)
+                    .unwrap(),
+                chunk.len()
+            );
+        }
+        for page in [1024 * 1024, 4 * 1024 * 1024] {
+            let volume = image
+                .unlock_with_cache_layout(1, credential, 16usize << 30, 1024 * 1024, page)
+                .unwrap();
+            let file = volume.open_file(file_path).unwrap();
+            let mut out = vec![0; 128 * 1024];
+            for offset in [
+                0,
+                511,
+                (page as u64 - 1).min(file.len() - 1),
+                file.len() / 2,
+                file.len() - 17,
+            ] {
+                let n = file.read_at(offset, &mut out, &cancel).unwrap();
+                assert_eq!(n, (file.len() - offset).min(out.len() as u64) as usize);
+                assert_eq!(&out[..n], &reference[offset as usize..offset as usize + n]);
+            }
+            assert_eq!(file.read_at(file.len(), &mut out, &cancel).unwrap(), 0);
+        }
+        for page in [0, 96 * 1024, 8 * 1024 * 1024] {
+            assert!(image
+                .unlock_with_cache_layout(1, credential, 16 * 1024 * 1024, 1024 * 1024, page)
+                .is_err());
+        }
+        assert!(image
+            .unlock_with_cache_layout(1, credential, 64 * 1024, 1024 * 1024, 1024 * 1024)
+            .is_err());
+    }
+}

@@ -6,6 +6,7 @@ import 'dart:isolate';
 import 'package:ffi/ffi.dart';
 import 'package:flutter/services.dart';
 import 'platform_storage.dart';
+import 'native_media.dart';
 
 class ReaderFailure implements Exception {
   ReaderFailure(this.code, this.message, {this.invalidated = false});
@@ -28,7 +29,8 @@ class _Bindings {
     final version = library.lookupFunction<Uint32 Function(), int Function()>(
       'vhdx_api_version',
     )();
-    if (version != 7) throw ReaderFailure('version', '读取组件版本不匹配，请重新解压完整程序。');
+    if (version != 9) throw ReaderFailure('version', '读取组件版本不匹配，请重新解压完整程序。');
+    NativeMedia.library = library;
     request = library
         .lookupFunction<
           Pointer<Utf8> Function(Uint64, Pointer<Uint8>, UintPtr),
@@ -237,7 +239,39 @@ class NativeBackend implements ReaderBackend {
 
   Future<Map<String, dynamic>> _requestRaw(Map<String, dynamic> request) async {
     if (_disposed) throw ReaderFailure('closed', '读取组件已关闭。');
-    if (_cancelled) throw ReaderFailure('cancelled', '操作已取消。');
+    // Revocation must still reach the worker after an operation was cancelled.
+    // Otherwise disposing a cancelled preview leaks its live media capability.
+    if (_cancelled &&
+        !{
+          'disk_cache_configure',
+          'disk_cache_clear',
+          'disk_cache_status',
+          'media_close',
+          'thumbnail_cancel',
+          'thumbnail_finish',
+        }.contains(request['op'])) {
+      throw ReaderFailure('cancelled', '操作已取消。');
+    }
+    // These Rust operations only touch bounded metadata. Calling them here
+    // lets cancellation/deadline control bypass an isolate blocked in media_open.
+    if ({
+      'thumbnail_begin',
+      'thumbnail_cancel',
+      'thumbnail_finish',
+    }.contains(request['op'])) {
+      final response = _bindings.call(_context, {
+        ...request,
+        if (request['op'] == 'thumbnail_begin') 'session': _session,
+      });
+      if (response['ok'] != true) {
+        final error = response['error'] as Map;
+        throw ReaderFailure(
+          error['code'] as String,
+          error['message'] as String,
+        );
+      }
+      return Map<String, dynamic>.from(response['data'] as Map);
+    }
     if (_pending.length >= 8) throw ReaderFailure('busy', '操作过多，请稍后重试。');
     final id = _nextId++;
     final complete = Completer<Map<String, dynamic>>();
@@ -252,6 +286,9 @@ class NativeBackend implements ReaderBackend {
           'vault_list',
           'vault_remove',
           'vault_clear',
+          'disk_cache_configure',
+          'disk_cache_clear',
+          'disk_cache_status',
         }.contains(request['op']))
           'session': _session,
       },

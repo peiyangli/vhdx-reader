@@ -225,13 +225,34 @@ impl Cache {
     }
 }
 /// A bounded plaintext page cache. Evicted pages are zeroized before deallocation.
+#[derive(Clone)]
+pub struct CacheControl(Rc<std::cell::Cell<bool>>);
+impl Default for CacheControl {
+    fn default() -> Self {
+        Self(Rc::new(std::cell::Cell::new(true)))
+    }
+}
+impl CacheControl {
+    pub fn enabled(&self) -> bool {
+        self.0.get()
+    }
+    pub fn set_enabled(&self, enabled: bool) {
+        self.0.set(enabled);
+    }
+}
+
 pub struct CachedReader {
     source: Rc<dyn ReadAt>,
     page_size: usize,
     capacity: usize,
     cache: RefCell<Cache>,
+    control: Option<CacheControl>,
 }
 impl CachedReader {
+    pub fn with_control(mut self, control: CacheControl) -> Self {
+        self.control = Some(control);
+        self
+    }
     pub fn new(source: Rc<dyn ReadAt>, page_size: usize, budget: usize) -> Result<Self> {
         if page_size == 0 || budget < page_size {
             return Err(Error::Invalid(
@@ -242,6 +263,7 @@ impl CachedReader {
             source,
             page_size,
             capacity: budget / page_size,
+            control: None,
             cache: RefCell::new(Cache {
                 pages: HashMap::new(),
                 oldest: None,
@@ -255,6 +277,18 @@ impl ReadAt for CachedReader {
         self.source.len()
     }
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+        if self
+            .control
+            .as_ref()
+            .is_some_and(|control| !control.enabled())
+        {
+            let mut cache = self.cache.borrow_mut();
+            cache.pages.clear();
+            cache.oldest = None;
+            cache.newest = None;
+            drop(cache);
+            return self.source.read_at(offset, buffer);
+        }
         if offset >= self.len() || buffer.is_empty() {
             return Ok(0);
         }
@@ -337,6 +371,98 @@ pub(crate) mod tests {
             self.reads.set(self.reads.get() + 1);
             self.memory.read_at(o, b)
         }
+    }
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn large_budget_is_lazy_and_pages_support_offsets_above_four_gib() {
+        struct VirtualSource {
+            reads: RefCell<Vec<(u64, usize)>>,
+        }
+        impl ReadAt for VirtualSource {
+            fn len(&self) -> u64 {
+                (32u64 << 30) + 17
+            }
+            fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize> {
+                let n = out.len().min(self.len().saturating_sub(offset) as usize);
+                self.reads.borrow_mut().push((offset, n));
+                for (i, byte) in out[..n].iter_mut().enumerate() {
+                    *byte = ((offset + i as u64) % 251) as u8;
+                }
+                Ok(n)
+            }
+        }
+        for page in [64, 128, 256, 512, 1024, 2048, 4096].map(|kib| kib * 1024) {
+            let source = Rc::new(VirtualSource {
+                reads: RefCell::new(Vec::new()),
+            });
+            let cache = CachedReader::new(source.clone(), page, 16usize << 30).unwrap();
+            assert_eq!(cache.capacity, (16usize << 30) / page);
+            assert_eq!(cache.cache.borrow().pages.capacity(), 0);
+            assert!(source.reads.borrow().is_empty());
+            let offset = (8u64 << 30) + page as u64 - 2;
+            let mut out = [0; 4];
+            cache.read_exact_at(offset, &mut out).unwrap();
+            assert_eq!(
+                out,
+                std::array::from_fn(|i| ((offset + i as u64) % 251) as u8)
+            );
+            assert_eq!(
+                &*source.reads.borrow(),
+                &[(8u64 << 30, page), ((8u64 << 30) + page as u64, page)]
+            );
+            cache.read_exact_at(offset, &mut out).unwrap();
+            assert_eq!(source.reads.borrow().len(), 2);
+            assert_eq!(cache.cache.borrow().pages.len(), 2);
+            assert_eq!(
+                cache
+                    .cache
+                    .borrow()
+                    .pages
+                    .values()
+                    .map(|p| p.bytes.len())
+                    .sum::<usize>(),
+                2 * page
+            );
+            assert_eq!(cache.read_at(source.len() - 2, &mut out).unwrap(), 2);
+            assert_eq!(source.reads.borrow().last(), Some(&(32u64 << 30, 17)));
+            assert_eq!(cache.read_at(source.len(), &mut out).unwrap(), 0);
+            // Use a tiny page count to exercise eviction with the same page sizes.
+            let small = CachedReader::new(source.clone(), page, 2 * page).unwrap();
+            for start in [0, page as u64, 2 * page as u64, 0] {
+                small.read_exact_at(start, &mut out).unwrap();
+                assert_eq!(
+                    out,
+                    std::array::from_fn(|i| ((start + i as u64) % 251) as u8)
+                );
+                assert!(small.cache.borrow().pages.len() <= 2);
+            }
+        }
+    }
+
+    #[test]
+    fn master_switch_bypasses_and_clears_memory_pages_then_can_reenable() {
+        let source = Rc::new(Counting {
+            memory: Memory((0..250).collect()),
+            reads: Cell::new(0),
+        });
+        let control = CacheControl::default();
+        let cache = CachedReader::new(source.clone(), 64, 128)
+            .unwrap()
+            .with_control(control.clone());
+        let mut out = [0; 4];
+        cache.read_exact_at(3, &mut out).unwrap();
+        cache.read_exact_at(3, &mut out).unwrap();
+        assert_eq!(source.reads.get(), 1);
+        control.set_enabled(false);
+        cache.read_exact_at(3, &mut out).unwrap();
+        cache.read_exact_at(3, &mut out).unwrap();
+        assert_eq!(source.reads.get(), 3);
+        assert_eq!(out, [3, 4, 5, 6]);
+        assert!(cache.cache.borrow().pages.is_empty());
+        control.set_enabled(true);
+        cache.read_exact_at(3, &mut out).unwrap();
+        cache.read_exact_at(3, &mut out).unwrap();
+        assert_eq!(source.reads.get(), 4);
     }
     #[test]
     fn cache_cross_page_eof_hits_and_eviction() {

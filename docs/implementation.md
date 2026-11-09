@@ -1,16 +1,77 @@
 # Implementation decisions
 
+## 新会话交接：HTTP 与缩略图优化（2026-11-09，两项代码与回归完成）
+
+原交接要求按以下顺序处理。2026-11-09 已完成 HTTP/native 对照原型及 Windows 播放实测，以及缩略图预算、取消、队列和重试修复。按用户最后确认，0.6.21+28 的普通播放与视频缩略图均默认使用原生回调，HTTP 仅保留为显式对照选项。已完成各平台重新打包及 Windows/Android 真机/Mac/iPhone 与 iPad 模拟器补测，产物在 `artifacts/0.6.21/`；真实数 GB 视频的具体慢因仍未复现。
+
+基线：0.6.20+27；平台 OpenSSL EVP 切换提交 `adfc133`，测试修正提交 `9e8c208`。各平台包、校验和和实际验证范围在 `artifacts/0.6.20/manifest.json`；目录按版本平铺，不增加多层 artifacts 子目录。
+
+### 本轮执行结果（2026-11-09）
+
+- 新增 `crates/vhdx-app/src/native_media.rs` 与 `app/lib/native_media.dart`，通过 `mpv_stream_cb_add_ro` 接入只读 `vhdx://` 回调。Rust 原生句柄仍由同一工作线程独占，不添加 Send/Sync；每次最多 256 KiB，复制到 mpv 缓冲区后清零，不经过 HTTP、Dart JSON 或明文临时文件。
+- `media_open.transport` 默认 `http`，可指定 `native`；Rust 旧 `media_open` API 缺省 HTTP 保持兼容，Flutter 普通播放与缩略图均显式默认选择 native，`--dart-define=VHDX_MEDIA_TRANSPORT=http` 可用于诊断对照。ABI 7 新增可选回调导出，运行时核对 libmpv API；Windows 实际为 2.1。各已发布平台包的符号已核对，首轮运行对照仅 Windows；新默认路径已补测 Windows、Android 真机、Mac 及 iPhone/iPad 模拟器。
+- 注册表用随机 token 和弱引用，独立 cookie 持有 Arc 状态，取消只写原子标志；工作线程关闭/锁卷/异常时撤销，cookie 等待 mpv close 释放。特别处理 media_kit dispose 后延迟 5 秒销毁 mpv 的生命周期。等待读取可取消，但不能中断单次原生阻塞 I/O。
+- 7 轮传输基准、36 次 Windows 播放对照已完成。纯传输明显减少等待；实际 AVI 首帧中位数 382.536 → 295.150 ms，普通 MP4 seek 32.673 → 16.819 ms；部分格式首帧、CPU 没有收益，首轮因此保留 HTTP 默认；后按用户明确要求将 0.6.21 默认改为 native 并补测。详细方法、数据和限制见 [read-performance.md](read-performance.md#http-与-libmpv-原生回调对照2026-11-09)，原始结果在 `.native/http-native/`。
+- 验证：Windows 37 项 Rust 测试、Linux 回调/存储故障回归、Flutter analyze、102 项单元/界面测试、36 次播放对照及 5 项 native 播放回归通过。修复取消后 `media_close` 被 Dart 拦截的问题，清理请求可继续撤销流。
+- 缩略图新增 `thumbnail_begin/cancel/finish` 元数据控制，以及 Rust 每任务 32 MiB 文件逻辑读取、64 MiB 镜像源读取预算和 8 秒截止时间；在读取前预留额度，打开阶段、重复偏移、多 Range、关闭后重新打开、HTTP/native 共用额度。正常播放没有这些限制。
+- 打开之前登记取消；元数据控制绕过阻塞的 Dart 读取 isolate 与 Rust I/O 队列，迟到文件句柄仍关闭。超时任务释放生成槽位，至多保留 2 个尚未结束的生成/清理任务，避免无限堆积；缓存查询保持独立。无法解码、超时或超预算的图片/视频记录为不可用，停止自动重复读取；临时队列/设备/会话错误仍可重试。过期流会在后续打开时回收，避免关闭请求因队列满而遗漏后占满文件槽位。
+- 可选诊断提供排队、打开、首帧事件、截图、关闭耗时，以及文件/镜像源累计字节、偏移/长度（每任务最多 256 条）；不记录媒体内容，默认不采集详细轨迹。用户明确不提供私密问题文件，按代码机制修复，并使用自行生成的 8 GiB 稀疏 MP4 验证，两路径均成功出图且后续普通视频正常完成。它不是数 GB 编码内容，不能据此断定用户文件的根因或加速倍率。
+- 后续补充：失败标记按镜像身份/源版本、分区、路径、大小与修改时间复用，跨 scope 重开仍生效；启用对应磁盘缓存时写入仅含 `unavailable: true` 的记录，应用重启后也跳过原文件读取/解码。BitLocker 默认仍只存内存，开启专属磁盘缓存后才持久化；关闭该开关会清除对应标记。文件元数据变化或清空缓存允许重新尝试，取消/锁卷/设备故障不持久标记为不可用。
+- 缩略图轮次验证：Windows 44 / Linux 45 项 Rust 测试及两端 Clippy、Flutter analyze、111 项单元/界面测试、4 项 Windows 缩略图集成回归及 5 项普通播放回归通过。详细预算口径、结果、复现步骤和限制见 [read-performance.md](read-performance.md#缩略图读取预算取消与队列修复2026-11-09)。
+- 后续重点是不同真实大视频格式/索引、移动端/Apple 与外置存储运行验证。单次原生阻塞 I/O 不能被强制中断，8 秒是停止继续工作和释放前端生成槽位的边界，不保证原生清理在 8 秒内完成。
+
+### 0.6.21+28 打包交付
+
+六个包平铺在 `artifacts/0.6.21/`，`manifest.json`、`SHA256SUMS` 与逐包 `.sha256` 已生成。包括 Windows x64、Android ARM64、macOS ARM64、iOS ARM64 未签名真机包、iOS ARM64 模拟器包及 Linux x64 CLI。普通播放和视频缩略图均默认 native，HTTP 只用于显式对照；旧 Rust 请求 API 缺省 HTTP 保持兼容，GUI 始终显式指定传输。Linux CLI 不涉及播放器传输。
+
+本次补测：Windows 9 项集成、Android 真机 4 项通过/1 项跳过、Mac 7 项通过/1 项跳过；iPhone 与 iPad 模拟器各 8 项 Flutter 通过/1 项跳过、3 项 Swift 通过/1 项跳过。跳过项仅系统凭据交互/独立宿主缺少凭据夹具，不包含媒体用例。Windows/Mac 各 111 项单元/界面测试通过；Mac 46 项 Rust 回归通过，Windows 44/Linux 45 与 Clippy 沿用同一未改变 Rust 源码的本轮结果。Mac 首次测试遇到临时缓存目录删除早于失败标记写入的测试清理竞态，已等待缓存任务结束再删除，复测通过；不涉及生产代码变更。
+
+Windows 文件与打包目录逐项一致，Android 验证 v2 签名、16 KiB ELF、Rust 输入/Gradle 合并/剥离输出与 APK 对应关系，Apple 验证框架依赖闭包、平台及签名。六包版本、归档完整性、许可证、私有测试文件排除和 SHA-256 均通过。Apple 取回后的哈希与构建主机一致。签名沿用开发方式：Android 开发签名、Mac ad-hoc；iOS 真机包需另行 Apple 签名，未进行本轮物理 iPhone/iPad 运行测试。
+
+构建来自当前未提交工作区，基线 `adfc133`；打包源码快照和日志在 `.native/release-0.6.21/`。未自动提交代码或上传外部发布服务。
+
+### 1. 先验证去掉视频本机 HTTP 中转的效果
+
+- 当前路径：libmpv → 本机 HTTP → Rust 读取工作线程 → VHDX/BitLocker/NTFS。视频负载不经过 Dart JSON；Rust 通道转移缓冲区所有权，不代表逐块复制整份数据。HTTP 内部每块最多 256 KiB，不等于每块独立发起 HTTP 请求。
+- 在保留 Flutter、media_kit/libmpv 和现有读取工作线程的前提下，验证 libmpv 自定义只读流回调（`mpv_stream_cb_add_ro`，open/read/seek/size/close）接入。项目已有 libmpv 头文件包含接口；各平台实际导出、ABI、播放器句柄接入和生命周期仍须核对。官方说明：https://github.com/mpv-player/mpv/blob/master/include/mpv/stream_cb.h 。
+- 先做 HTTP 与原生回调可对照的原型，以同一批文件、相同缓存条件测首帧、seek、CPU、吞吐和读取量，再决定是否替换。没有测得收益前，不宣称加速比例。
+- 原生句柄及缓存使用 Rc/RefCell，不能直接跨线程，也不能通过随意添加 Send/Sync 绕过所有权约束。第一步保留读取工作线程，只移除 HTTP/socket；是否重构线程归属另行评估。
+- 覆盖关闭预览、切换文件、锁定卷、取消、存储断开及播放器销毁；保证回调与缓冲区存活期正确，无死锁/悬空访问。维持禁止明文媒体落盘的既有策略。
+- 入口：`crates/vhdx-app/src/media.rs`，`crates/vhdx-app/src/lib.rs` 的 `MediaRead` / `read_media`，`app/lib/media_preview.dart`。已有基准见 `docs/read-performance.md` 与 `media_benchmark`。
+
+### 2. 再处理整个缩略图链路，重点排查数 GB 视频变慢
+
+用户反馈：进入视频列表目录时，几个 GB 的视频缩略图很久才显示，感觉读取了整个文件。尚未取得这个大文件的读取轨迹，不能把“整文件扫描”写成已证实根因。用户已明确这些是私密文件，当前不提供资源，授权从理论和代码机制上优化修改。旧的 `examples/bitlockervhdx.vhdx` 中的小视频及新生成的稀疏文件都不能替代该问题样本。
+
+修复前确认的代码现状（保留作为问题基线；本轮实现见上方结果）：
+
+- `app/lib/thumbnails.dart` 取第一张可解码帧，没有主动 seek 到视频中间；缓存键使用路径、大小、修改时间等元数据，不计算视频内容全文件哈希。
+- 缩略图播放器已禁用普通预读及磁盘缓存，但打开时的格式/流信息/索引探测仍可能读取数据。读取尾部索引不等于从头扫到尾。
+- 32 MiB 是 Dart 截图循环里检查的 HTTP 已发送字节数，属于事后软限制；不约束打开阶段全部读取，也不等于底层磁盘读取量。Rust 层尚无缩略图专用累计读取硬预算。
+- 8 秒计时器发出协作取消，不能保证 8 秒内原生操作及清理结束。`MediaPreviewSource.open` 返回后才登记任务清理回调，打开期间存在取消覆盖缺口。
+- 视频缩略图生成并发为 1，慢文件会拖住后面未缓存任务；失败重试可能放大等待。缓存查询已独立排队，应保留这点。
+
+原处理方向（1–3 已实现并回归；第 4 项的大视频覆盖仍需后续扩展）：
+
+1. 分别记录排队、打开、首帧、截图、关闭耗时；记录请求偏移/长度、累计返回字节、底层读取量及重试次数，区分随机探测、顺序扫描、重复读取和纯解码等待。
+2. 将缩略图专用累计读取预算、截止时间和取消检查下沉至 Rust，覆盖打开到关闭全过程；多 HTTP 请求或重新打开不能轻易绕过预算。正常视频播放不套用缩略图预算。原生单次阻塞读的可中断边界要据实说明。
+3. 慢文件超预算及时让出生成队列，先显示类型占位；避免连续自动重试拖住目录。保留缓存命中快速显示、BitLocker 缓存设置和锁定撤销语义。
+4. 大文件样本覆盖常见 MP4/MKV、索引位置/缺失、不同编码和普通/BitLocker 卷；同一组样本对照 HTTP 与原生回调，不能假设移除 HTTP 会消除解复用器的不必要扫描。
+
+补充：PDF 当前使用随机读取回调，不走 HTTP，但经过 JSON/Base64；这是独立优化点，不抢占上述两项优先顺序。
+
+
 ## Current milestone
 
 Windows x64, Android ARM64 and macOS ARM64 Flutter browser, plus Windows/Linux CLI. Pure read-only local access to an independent VHDX stored on external SSD. The initial UI is integrated with the real reader.
 
 The data path is `LocalFile -> libvhdi -> partition Slice -> optional libbde -> CachedReader -> libfsntfs -> File`. Each native layer consumes a `libbfio` callback handle. File access does not require a mounted disk, administrator rights, whole-image conversion, or plaintext intermediate volumes.
 
-The Flutter shell now uses a small versioned C ABI (version 7) (`crates/vhdx-app/include/vhdx_app.h`) through `dart:ffi`. This is a deliberate first integration instead of introducing flutter_rust_bridge code generation. An auxiliary Dart isolate makes blocking ABI calls; a dedicated Rust worker owns a map of independent native contexts. Every image tab has its own context ID, native image, unlocked volume, cache and generation. The UI retains tab widgets and their browsing/preview state; closing one disposes only that context. Reopening the same normalized path focuses the existing tab. The shared eight-slot queue rejects overflow; native execution remains serialized. Cancellation targets the active operation only if its context ID matches. Lock/close increment that context’s session generation and stale requests are rejected. Typed secrets and imported credential files use the same credential parser as the CLI; only paths, not password values, are passed as process arguments.
+The Flutter shell now uses a small versioned C ABI (version 9) (`crates/vhdx-app/include/vhdx_app.h`) through `dart:ffi`. This is a deliberate first integration instead of introducing flutter_rust_bridge code generation. An auxiliary Dart isolate makes blocking ABI calls; a dedicated Rust worker owns a map of independent native contexts. Every image tab has its own context ID, native image, unlocked volume, cache and generation. The UI retains tab widgets and their browsing/preview state; closing one disposes only that context. Reopening the same normalized path focuses the existing tab. The shared eight-slot queue rejects overflow; native execution remains serialized. Cancellation targets the active operation only if its context ID matches. Lock/close increment that context’s session generation and stale requests are rejected. Typed secrets and imported credential files use the same credential parser as the CLI; only paths, not password values, are passed as process arguments.
 
-The UI implements image/partition selection, password and recovery unlock, paginated directory browsing, hiding system entries, loaded-entry filtering, bounded text/image previews, random-access PDF viewing, export and cancellation. Plaintext preview bytes use Base64 over this small JSON ABI. PDF adds file_open/file_read/file_close tokens, a serialized 64 KiB page reader and a 1 MiB Dart LRU cache. PdfDocumentRefCustom disables whole-file caching and reads through the same bounded ABI; no plaintext PDF is staged on disk. Viewer state is retained across image tabs and hidden viewers pause rendering. The 32 MiB render cache target is separate from the Rust/Dart byte caches and is not a process memory limit. This path is for bounded preview requests; video streaming uses the separate binary adapter described below.
+The UI implements image/partition selection, password and recovery unlock, paginated directory browsing, hiding system entries, loaded-entry filtering, bounded text/image previews, random-access PDF viewing, export and cancellation. Plaintext preview bytes use Base64 over this small JSON ABI. PDF adds file_open/file_read/file_close tokens, a serialized 64 KiB page reader and a 1 MiB Dart LRU cache. PdfDocumentRefCustom disables whole-file caching and reads through the same bounded ABI; no whole PDF is staged on disk; the optional shared file disk cache can persist accessed plaintext pages. Viewer state is retained across image tabs and hidden viewers pause rendering. The 32 MiB render cache target is separate from the Rust/Dart byte caches and is not a process memory limit. This path is for bounded preview requests; video streaming uses the separate binary adapter described below.
 
-The media_open/media_close/media_status commands expose a single-file loopback HTTP stream protected by a random 256-bit URL token. Each stream accepts at most four clients, bounded headers, exact Host/path checks and GET/HEAD only; Origin and request bodies are rejected. It supports single byte ranges (206/416), suffix ranges and full responses. Socket threads ask the native worker for at most 256 KiB per read using the same bounded queue, then write with backpressure. Lock/close invalidates the generation and shuts down sockets; a disconnected seek stops further work after the current chunk. No media payload traverses Dart JSON. The player uses an 8 MiB forward and 2 MiB backward packet cache, not a total process limit. Disk caching is disabled and checked before loading; loadfile avoids media_kit open’s temporary playlist. Automatic external references/subtitles/audio files are disabled. Switching tabs pauses playback, returning preserves position without automatically resuming.
+The media_open/media_close/media_status commands expose a single-file loopback HTTP stream protected by a random 256-bit URL token. Each stream accepts at most four clients, bounded headers, exact Host/path checks and GET/HEAD only; Origin and request bodies are rejected. It supports single byte ranges (206/416), suffix ranges and full responses. Socket threads ask the native worker for at most 256 KiB per read using the same bounded queue, then write with backpressure. Lock/close invalidates the generation and shuts down sockets; a disconnected seek stops further work after the current chunk. No media payload traverses Dart JSON. By default, the player uses a 64 MiB forward and 2 MiB backward packet cache with up to 30 seconds of readahead, independently of the volume read-cache setting; these are not total process limits. Initial playback, seek restarts and underruns buffer up to 3 seconds before resuming (mpv may resume earlier at EOF or the byte limit). The settings page exposes forward capacity (8–256 MiB), readahead (5–120 seconds) and resume buffering (1/3/5 seconds); preferences are persisted under `cache.playback` and passed to each newly opened video without changing an active player. Thumbnail players retain their separate 1 MiB budget with readahead disabled. mpv disk caching is disabled and checked before loading (independent of the optional native file disk cache); loadfile avoids media_kit open’s temporary playlist. Automatic external references/subtitles/audio files are disabled. Switching tabs pauses playback, returning preserves position without automatically resuming.
 
 ## Android storage and packaging
 
@@ -39,7 +100,7 @@ The builder defaults to the native host CPU with an explicit NativeBuild.xcconfi
 - Preflight checks both VHDX header CRC32C values, active log identifier and both region tables. The pinned libvhdi header reader does not enforce CRC32C; degraded copies are conservatively rejected instead of relying on its sequence selection.
 - GPT header and entry-array CRC32 are checked, as are partition bounds and overlaps. The implementation rejects malformed primary tables; recovery from backup GPT is not implemented.
 - Source files open read-only. On Windows only FILE_SHARE_READ is allowed, preventing concurrent writers/deletion. Unix currently relies on an immutable-image usage contract.
-- Rust caches decrypted 64 KiB pages with a bounded page count. Evicted buffers are zeroized. This does not bound the entire process, prevent OS paging, or guarantee erasure of copies held inside native libraries.
+- Rust caches decrypted pages with configurable page size and capacity (64 KiB pages by default). The optional shared plaintext disk cache has its own quota. Evicted buffers are zeroized. This does not bound the entire process, prevent OS paging, or guarantee erasure of copies held inside native libraries.
 
 ## Remaining milestones
 
@@ -69,3 +130,21 @@ No speed or broad media-format compatibility claim is established by the tiny ex
 ## BitLocker 凭据库（v0.6）
 
 见 [credential-vault.md](credential-vault.md)。ABI 6 的保存、读取和解锁都在 Rust 工作线程中执行，Flutter 仅接收非秘密元数据。系统适配分别为 Apple Security.framework、Windows DPAPI 和 Android Keystore/JNI；Linux 禁用记住，无明文回退。
+
+
+## Configurable volume cache layout (ABI 8)
+
+Unlock JSON `cache` now accepts `plaintext_page_kib` (64, 128, 256, 512, 1024, 2048, 4096; default 64). `plaintext_mib` accepts powers of two from 16 through 16384. The native worker validates the whitelist and checked MiB-to-byte conversion before touching the existing volume; unsupported 32-bit budgets are rejected instead of wrapping. Defaults for omitted fields remain backward compatible. This layout required ABI 8; the current frontend expects ABI 9 for the disk-cache controls below.
+
+The core keeps `unlock` and `unlock_with_caches` with their existing 64 KiB defaults, and adds `unlock_with_cache_layout` for explicit plaintext page sizing. Each unlocked volume owns a lazy LRU page cache under NTFS; page keys are offsets in that volume, shared across file and metadata reads. Ciphertext coalescing remains independently budgeted with 64 KiB pages. The frontend persists layout changes for the next unlock/open and displays maximum page count. Neither capacity selection nor opening a volume preallocates the full budget.
+
+
+## Optional shared disk cache (ABI 9)
+
+`disk_cache_configure` takes `cache_enabled` (master file-cache switch), `enabled` (disk only), an absolute app-owned `directory`, `max_gib` (1–128 powers of two), and `retention_days` (0/1/7/30, with 0 meaning no time expiry). `disk_cache_status` and `disk_cache_clear` are session-independent worker commands. A single `Rc<RefCell<DiskCache>>` is shared across image contexts; commands and reads are serialized on the existing native worker. The OS directory lock prevents competing processes from keeping inconsistent quota indexes. Configuration errors are not treated as source I/O errors and do not lock healthy volumes.
+
+The read path is memory plaintext pages → disk plaintext pages → decrypted/source data. BitLocker credential validation and NTFS signature checks precede attaching the disk layer. Cache namespace includes the opened source path/URI, its metadata revision (or a unique per-open identity when unavailable), partition offsets, page size and page offset. It does not hash the whole image and cannot detect deliberately preserved source metadata. Blocks carry a format magic and SHA-256 payload checksum; partial or corrupt blocks are discarded and read from source. Writes use a temporary file and rename. Successful data reads remain successful if cache writes fail; source errors are never cached. Cache length counts block payload and headers, not filesystem allocation metadata.
+
+The master control is shared by plaintext memory caches, ciphertext memory caches and disk readers, including existing volumes. Disabled memory readers drop their retained pages on their next read and bypass the cache; disk reads and writes are bypassed immediately. Player/decoder buffering and thumbnail caches remain separate. Toggling disk use or master use does not delete persistent blocks. Manual clear removes only managed files and reports deletion failures. Existing memory/player data is not cleared by the disk-only clear command.
+
+Disk LRU index loads once per configured directory, uses an ordered access index for eviction, and persists last use in file timestamps. Expiry is checked at initialization/configuration/status, on expired hits, and at most once per minute during writes; no background daemon or scheduling is installed. Capacity shrink trims immediately. Permanent retention still obeys quota and manual clear; OS cache-folder eviction remains possible. UI saves preference changes atomically and rolls native configuration back if saving fails. Existing volumes retain their page size until re-unlock.

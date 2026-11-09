@@ -1,3 +1,4 @@
+import 'thumbnails_test.dart' as thumbnails;
 import 'vault_test.dart' as vault;
 import 'native_test.dart' as native;
 import 'pdf_test.dart' as pdf;
@@ -11,5 +12,6 @@ void main() {
   native.main();
   pdf.main();
   media.main();
+  thumbnails.main();
   cache.main();
 }

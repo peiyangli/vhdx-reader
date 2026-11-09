@@ -1,3 +1,4 @@
+import 'thumbnails_test.dart' as thumbnails;
 import 'dart:convert';
 import 'dart:math' as math;
 import '../test/ui_actions.dart';
@@ -63,6 +64,7 @@ Future<int> rotation() async =>
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+  thumbnails.main();
   testWidgets('Android shake detector rejects noise and confirms stable target', (
     tester,
   ) async {
@@ -271,6 +273,7 @@ void main() {
             source.position.inMilliseconds > 500,
       );
       expect(source.error, isNull);
+      expect((await source.statistics())['transport'], 'native');
       expect(
         await (source.player.platform as NativePlayer).getProperty(
           'cache-on-disk',

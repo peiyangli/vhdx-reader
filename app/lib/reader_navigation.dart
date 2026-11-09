@@ -1,3 +1,5 @@
+import 'disk_cache_settings.dart';
+import 'playback_buffer_settings.dart';
 import 'package:flutter/material.dart';
 import 'platform_storage.dart';
 import 'recent_images.dart';
@@ -216,12 +218,16 @@ class ReaderSettingsPage extends StatelessWidget {
     this.cacheSettings = const CacheSettings(),
     this.onCacheSettings,
     this.onClearThumbnails,
+    this.onClearFileDiskCache,
+    this.diskCacheError,
     this.seekSeconds = 5,
     this.onSeekSeconds,
   });
   final int seekSeconds;
   final ValueChanged<int>? onSeekSeconds;
   final Future<void> Function()? onClearThumbnails;
+  final Future<void> Function()? onClearFileDiskCache;
+  final String? diskCacheError;
   final CacheSettings cacheSettings;
   final ValueChanged<CacheSettings>? onCacheSettings;
   final bool showShake;
@@ -237,22 +243,40 @@ class ReaderSettingsPage extends StatelessWidget {
   final VoidCallback onCredentials;
   final VoidCallback onBack;
 
-  Widget _cacheOption(BuildContext context, {required bool plaintext}) {
-    final title = plaintext ? '文件读取缓存' : 'BitLocker 密文缓存';
-    final current = plaintext
-        ? cacheSettings.plaintextMiB
-        : cacheSettings.ciphertextMiB;
-    final options = plaintext
-        ? CacheSettings.plaintextOptions
-        : CacheSettings.ciphertextOptions;
-    final name = plaintext ? 'plaintext' : 'ciphertext';
+  Widget _cacheOption(BuildContext context, {required String kind}) {
+    final (title, current, options, format) = switch (kind) {
+      'plaintext' => (
+        '文件读取缓存（内存）',
+        cacheSettings.plaintextMiB,
+        CacheSettings.plaintextOptions,
+        CacheSettings.formatMiB,
+      ),
+      'plaintext-page' => (
+        '文件缓存分块大小',
+        cacheSettings.plaintextPageKiB,
+        CacheSettings.plaintextPageOptions,
+        CacheSettings.formatKiB,
+      ),
+      _ => (
+        'BitLocker 密文缓存',
+        cacheSettings.ciphertextMiB,
+        CacheSettings.ciphertextOptions,
+        CacheSettings.formatMiB,
+      ),
+    };
     return ListTile(
-      key: ValueKey('cache-$name'),
+      key: ValueKey('cache-$kind'),
       leading: Icon(
-        plaintext ? Icons.memory_outlined : Icons.enhanced_encryption_outlined,
+        kind == 'ciphertext'
+            ? Icons.enhanced_encryption_outlined
+            : Icons.memory_outlined,
       ),
       title: Text(title),
-      subtitle: Text('$current MiB / 卷'),
+      subtitle: Text(
+        kind == 'plaintext-page'
+            ? '${format(current)} / 块 · 最多 ${cacheSettings.plaintextPageCount} 块'
+            : '${format(current)} / 卷',
+      ),
       trailing: const Icon(Icons.chevron_right, size: 20),
       enabled: onCacheSettings != null,
       onTap: () async {
@@ -263,7 +287,7 @@ class ReaderSettingsPage extends StatelessWidget {
             children: [
               for (final size in options)
                 SimpleDialogOption(
-                  key: ValueKey('cache-$name-$size'),
+                  key: ValueKey('cache-$kind-$size'),
                   onPressed: () => Navigator.pop(context, size),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(vertical: 8),
@@ -277,7 +301,7 @@ class ReaderSettingsPage extends StatelessWidget {
                         const SizedBox(width: 12),
                         Flexible(
                           child: Text(
-                            '$size MiB${size == options.first ? '（默认）' : ''}',
+                            '${format(size)}${size == options.first ? '（默认）' : ''}',
                           ),
                         ),
                       ],
@@ -288,16 +312,128 @@ class ReaderSettingsPage extends StatelessWidget {
           ),
         );
         if (selected != null && selected != current) {
+          onCacheSettings?.call(switch (kind) {
+            'plaintext' => cacheSettings.copyWith(plaintextMiB: selected),
+            'plaintext-page' => cacheSettings.copyWith(
+              plaintextPageKiB: selected,
+            ),
+            _ => cacheSettings.copyWith(ciphertextMiB: selected),
+          });
+        }
+      },
+    );
+  }
+
+  Widget _diskOption(BuildContext context, {required bool capacity}) {
+    final settings = cacheSettings.disk;
+    final name = capacity ? 'capacity' : 'retention';
+    final title = capacity ? '磁盘缓存最大容量' : '磁盘缓存自动清理';
+    final current = capacity ? settings.maxGiB : settings.retentionDays;
+    String label(int value) => capacity
+        ? '$value GiB'
+        : value == 0
+        ? '永久（不按时间清理）'
+        : '$value 天未使用后清理';
+    return ListTile(
+      key: ValueKey('file-disk-$name'),
+      title: Text(title),
+      subtitle: Text('${label(current)}${capacity ? ' / 所有镜像共用' : ''}'),
+      leading: Icon(
+        capacity ? Icons.storage_outlined : Icons.auto_delete_outlined,
+      ),
+      trailing: const Icon(Icons.chevron_right, size: 20),
+      enabled: onCacheSettings != null,
+      onTap: () async {
+        final selected = await showDialog<int>(
+          context: context,
+          builder: (context) => SimpleDialog(
+            title: Text(title),
+            children: [
+              for (final value
+                  in capacity
+                      ? DiskCacheSettings.capacityOptions
+                      : DiskCacheSettings.retentionOptions)
+                SimpleDialogOption(
+                  key: ValueKey('file-disk-$name-$value'),
+                  onPressed: () => Navigator.pop(context, value),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Text(
+                      '${label(value)}${value == current ? ' ✓' : ''}',
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+        if (selected != null && selected != current) {
           onCacheSettings?.call(
             cacheSettings.copyWith(
-              plaintextMiB: plaintext ? selected : cacheSettings.plaintextMiB,
-              ciphertextMiB: plaintext ? cacheSettings.ciphertextMiB : selected,
+              disk: capacity
+                  ? settings.copyWith(maxGiB: selected)
+                  : settings.copyWith(retentionDays: selected),
             ),
           );
         }
       },
     );
   }
+
+  Widget _playbackOption(
+    BuildContext context, {
+    required String name,
+    required String title,
+    required String unit,
+    required int current,
+    required int defaultValue,
+    required List<int> options,
+    required PlaybackBufferSettings Function(int) update,
+  }) => ListTile(
+    key: ValueKey('playback-$name'),
+    leading: const Icon(Icons.slow_motion_video_outlined),
+    title: Text(title),
+    subtitle: Text('$current $unit'),
+    trailing: const Icon(Icons.chevron_right, size: 20),
+    enabled: onCacheSettings != null,
+    onTap: () async {
+      final selected = await showDialog<int>(
+        context: context,
+        builder: (context) => SimpleDialog(
+          title: Text(title),
+          children: [
+            for (final value in options)
+              SimpleDialogOption(
+                key: ValueKey('playback-$name-$value'),
+                onPressed: () => Navigator.pop(context, value),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Row(
+                    children: [
+                      Icon(
+                        value == current
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_unchecked,
+                      ),
+                      const SizedBox(width: 12),
+                      Flexible(
+                        child: Text(
+                          '$value $unit${value == defaultValue ? '（默认）' : ''}',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      );
+      if (selected != null && selected != current) {
+        onCacheSettings?.call(
+          cacheSettings.copyWith(playback: update(selected)),
+        );
+      }
+    },
+  );
 
   @override
   Widget build(BuildContext context) => CallbackShortcuts(
@@ -447,13 +583,106 @@ class ReaderSettingsPage extends StatelessWidget {
                     onChanged: busy ? null : onShowSystem,
                   ),
                   const Divider(),
-                  _cacheOption(context, plaintext: true),
-                  _cacheOption(context, plaintext: false),
+                  _playbackOption(
+                    context,
+                    name: 'buffer-mib',
+                    title: '播放器缓冲容量',
+                    unit: 'MiB / 视频',
+                    current: cacheSettings.playback.forwardMiB,
+                    defaultValue: const PlaybackBufferSettings().forwardMiB,
+                    options: PlaybackBufferSettings.forwardOptions,
+                    update: (value) =>
+                        cacheSettings.playback.copyWith(forwardMiB: value),
+                  ),
+                  _playbackOption(
+                    context,
+                    name: 'read-ahead-seconds',
+                    title: '播放预读时长',
+                    unit: '秒',
+                    current: cacheSettings.playback.readAheadSeconds,
+                    defaultValue:
+                        const PlaybackBufferSettings().readAheadSeconds,
+                    options: PlaybackBufferSettings.readAheadOptions,
+                    update: (value) => cacheSettings.playback.copyWith(
+                      readAheadSeconds: value,
+                    ),
+                  ),
+                  _playbackOption(
+                    context,
+                    name: 'resume-seconds',
+                    title: '恢复播放缓冲时长',
+                    unit: '秒',
+                    current: cacheSettings.playback.resumeSeconds,
+                    defaultValue: const PlaybackBufferSettings().resumeSeconds,
+                    options: PlaybackBufferSettings.resumeOptions,
+                    update: (value) =>
+                        cacheSettings.playback.copyWith(resumeSeconds: value),
+                  ),
                   const Padding(
                     padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
                     child: Text(
-                      '以上两项读取缓存仅保存在内存。文件读取缓存有利于重复读取和来回拖动；密文缓存用于合并 BitLocker 小读取。\n'
-                      '按每个已解锁卷分别计算，多个卷会累加。修改后重新解锁或重新打开镜像生效。',
+                      '播放器缓冲用于应对外接盘读取和视频码率波动，仅保存在内存。预读同时受容量和时长限制。每个打开的视频单独计量，与下方文件读取缓存分别占用内存。\n'
+                      '恢复播放缓冲时长是开始播放、拖动或卡顿后希望攒够的视频时长，并非固定等待时间；调大可能减少反复卡顿，也可能延长等待。修改后下次打开视频生效。',
+                      style: TextStyle(fontSize: 12, color: Color(0xff718098)),
+                    ),
+                  ),
+                  const Divider(),
+                  SwitchListTile.adaptive(
+                    key: const Key('file-cache-enabled'),
+                    title: const Text('文件缓存总开关'),
+                    subtitle: const Text(
+                      '统一控制文件内存、BitLocker 密文和文件磁盘缓存；播放器缓冲独立设置',
+                    ),
+                    value: cacheSettings.enabled,
+                    onChanged: onCacheSettings == null
+                        ? null
+                        : (value) => onCacheSettings!(
+                            cacheSettings.copyWith(enabled: value),
+                          ),
+                  ),
+                  SwitchListTile.adaptive(
+                    key: const Key('file-disk-enabled'),
+                    title: const Text('文件磁盘缓存'),
+                    subtitle: const Text('将读取过的数据缓存到本机内部存储，重开后可复用'),
+                    value: cacheSettings.disk.enabled,
+                    onChanged: onCacheSettings == null
+                        ? null
+                        : (value) => onCacheSettings!(
+                            cacheSettings.copyWith(
+                              disk: cacheSettings.disk.copyWith(enabled: value),
+                            ),
+                          ),
+                  ),
+                  _diskOption(context, capacity: true),
+                  _diskOption(context, capacity: false),
+                  ListTile(
+                    key: const Key('clear-file-disk-cache'),
+                    leading: const Icon(Icons.delete_sweep_outlined),
+                    title: const Text('立即清空文件磁盘缓存'),
+                    onTap: onClearFileDiskCache,
+                  ),
+                  if (diskCacheError != null)
+                    Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Text(diskCacheError!),
+                    ),
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+                    child: Text(
+                      '与内存缓存分别计量，磁盘容量由所有镜像共用。按需写入，容量满时淘汰最久未使用的数据；启动、读写和修改设置时检查过期数据。“永久”不按时间清理，容量满时仍会淘汰。\n'
+                      'BitLocker 解密后的数据以明文保存在本机。关闭开关会停止使用磁盘缓存，已有文件保留，可手动清空。分块大小使用下方“文件缓存分块大小”；修改磁盘选项立即生效。',
+                      style: TextStyle(fontSize: 12, color: Color(0xff718098)),
+                    ),
+                  ),
+                  const Divider(),
+                  _cacheOption(context, kind: 'plaintext'),
+                  _cacheOption(context, kind: 'plaintext-page'),
+                  _cacheOption(context, kind: 'ciphertext'),
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(16, 4, 16, 16),
+                    child: Text(
+                      '读取缓存仅保存在内存，按需分块填充，达到上限后淘汰最久未访问的块。容量越大，可保留的已读数据越多；分块越大，小范围读取时也可能读入更多无关数据。\n'
+                      '容量按每个已解锁卷计算，多个卷会累加，并与播放器缓冲分别占用内存。GiB 档位请按设备可用内存选择，不会立即分配全部容量。BitLocker 密文缓存继续使用独立的 64 KiB 分块。\n修改后重新解锁或重新打开镜像生效。',
                       style: TextStyle(fontSize: 12, color: Color(0xff718098)),
                     ),
                   ),

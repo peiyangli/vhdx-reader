@@ -1,45 +1,89 @@
 import 'dart:convert';
 import 'dart:io';
+import 'playback_buffer_settings.dart';
+import 'disk_cache_settings.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 class CacheSettings {
   const CacheSettings({
+    this.enabled = true,
+    this.playback = const PlaybackBufferSettings(),
+    this.disk = const DiskCacheSettings(),
     this.plaintextMiB = 16,
+    this.plaintextPageKiB = 64,
     this.ciphertextMiB = 1,
     this.thumbnailDisk = true,
     this.bitLockerThumbnailDisk = false,
   });
+  final bool enabled;
+  final PlaybackBufferSettings playback;
+  final DiskCacheSettings disk;
   final bool thumbnailDisk;
   final bool bitLockerThumbnailDisk;
   CacheSettings copyWith({
+    bool? enabled,
+    PlaybackBufferSettings? playback,
+    DiskCacheSettings? disk,
     int? plaintextMiB,
+    int? plaintextPageKiB,
     int? ciphertextMiB,
     bool? thumbnailDisk,
     bool? bitLockerThumbnailDisk,
   }) => CacheSettings(
+    enabled: enabled ?? this.enabled,
+    playback: playback ?? this.playback,
+    disk: disk ?? this.disk,
     plaintextMiB: plaintextMiB ?? this.plaintextMiB,
+    plaintextPageKiB: plaintextPageKiB ?? this.plaintextPageKiB,
     ciphertextMiB: ciphertextMiB ?? this.ciphertextMiB,
     thumbnailDisk: thumbnailDisk ?? this.thumbnailDisk,
     bitLockerThumbnailDisk:
         bitLockerThumbnailDisk ?? this.bitLockerThumbnailDisk,
   );
-  static const plaintextOptions = [16, 32, 64, 128, 256];
+  static const plaintextOptions = [
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+  ];
+  static const plaintextPageOptions = [64, 128, 256, 512, 1024, 2048, 4096];
+  static String formatMiB(int value) =>
+      value >= 1024 ? '${value ~/ 1024} GiB' : '$value MiB';
+  static String formatKiB(int value) =>
+      value >= 1024 ? '${value ~/ 1024} MiB' : '$value KiB';
+  int get plaintextPageCount => plaintextMiB * 1024 ~/ plaintextPageKiB;
   static const ciphertextOptions = [1, 2, 4, 8, 16];
   final int plaintextMiB;
+  final int plaintextPageKiB;
   final int ciphertextMiB;
   bool get valid =>
+      disk.valid &&
+      playback.valid &&
       plaintextOptions.contains(plaintextMiB) &&
+      plaintextPageOptions.contains(plaintextPageKiB) &&
       ciphertextOptions.contains(ciphertextMiB);
 
+  // Native unlock only accepts volume budgets; playback stays in Dart.
   Map<String, dynamic> toJson() => {
     'plaintext_mib': plaintextMiB,
+    'plaintext_page_kib': plaintextPageKiB,
     'ciphertext_mib': ciphertextMiB,
   };
 
   factory CacheSettings.fromJson(dynamic value) {
     if (value is! Map) return const CacheSettings();
     return CacheSettings(
+      enabled: value['enabled'] != false,
+      playback: PlaybackBufferSettings.fromJson(value['playback']),
+      disk: DiskCacheSettings.fromJson(value['disk']),
       thumbnailDisk: value['thumbnail_disk'] != false,
       bitLockerThumbnailDisk: value['bitlocker_thumbnail_disk'] == true,
       plaintextMiB:
@@ -47,6 +91,11 @@ class CacheSettings {
               plaintextOptions.contains(value['plaintext_mib'])
           ? value['plaintext_mib'] as int
           : 16,
+      plaintextPageKiB:
+          value['plaintext_page_kib'] is int &&
+              plaintextPageOptions.contains(value['plaintext_page_kib'])
+          ? value['plaintext_page_kib'] as int
+          : 64,
       ciphertextMiB:
           value['ciphertext_mib'] is int &&
               ciphertextOptions.contains(value['ciphertext_mib'])
@@ -102,6 +151,9 @@ class CacheSettingsStore {
           'version': 1,
           'cache': {
             ...value.toJson(),
+            'enabled': value.enabled,
+            'playback': value.playback.toJson(),
+            'disk': value.disk.toJson(),
             'thumbnail_disk': value.thumbnailDisk,
             'bitlocker_thumbnail_disk': value.bitLockerThumbnailDisk,
           },

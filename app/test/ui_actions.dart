@@ -8,6 +8,26 @@ Future<void> openReaderSettings(WidgetTester tester) async {
   await tester.pumpAndSettle();
 }
 
+Future<void> ensureReaderSettingVisible(
+  WidgetTester tester,
+  Finder item,
+) async {
+  final scrollable = find
+      .descendant(
+        of: find.byKey(const Key('reader-settings-page')),
+        matching: find.byType(Scrollable),
+      )
+      .first;
+  await tester.scrollUntilVisible(
+    item,
+    120,
+    scrollable: scrollable,
+    maxScrolls: 30,
+  );
+  await tester.ensureVisible(item);
+  await tester.pumpAndSettle();
+}
+
 Future<void> browserAction(
   WidgetTester tester,
   String action, {
@@ -26,7 +46,9 @@ Future<void> browserAction(
     await tester.pumpAndSettle();
   }
   final item = find.byKey(ValueKey(action));
-  if (item.evaluate().isEmpty && !display) {
+  if (action == 'show-system' || action == 'credential-manager') {
+    await ensureReaderSettingVisible(tester, item);
+  } else if (item.evaluate().isEmpty && !display) {
     await tester.scrollUntilVisible(
       item,
       160,

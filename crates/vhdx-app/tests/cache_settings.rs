@@ -11,7 +11,7 @@ fn custom_cache_budgets_unlock_read_and_invalid_budgets_preserve_volume() {
     let opened = call(json!({"op":"open","path":root.join("bitlockervhdx.vhdx")}));
     assert_eq!(opened["ok"], true);
     let session = opened["session"].as_u64().unwrap();
-    let cache = json!({"plaintext_mib":64,"ciphertext_mib":4});
+    let cache = json!({"plaintext_mib":16384,"ciphertext_mib":4,"plaintext_page_kib":1024});
     let unlocked = call(json!({"op":"unlock","session":session,"partition":1,
         "mode":"password","credential_file":root.join("password.txt"),"cache":cache}));
     assert_eq!(unlocked["ok"], true);
@@ -23,12 +23,18 @@ fn custom_cache_budgets_unlock_read_and_invalid_budgets_preserve_volume() {
     assert_eq!(before["data"]["size"], 5);
     for op in ["unlock", "unlock_saved"] {
         let mut invalid =
-            json!({"op":op,"session":session,"partition":1,"cache":{"plaintext_mib":4096}});
+            json!({"op":op,"session":session,"partition":1,"cache":{"plaintext_mib":32768}});
         if op == "unlock" {
             invalid["mode"] = json!("none");
         }
         assert_eq!(call(invalid)["ok"], false);
         assert_eq!(read()["data"], before["data"]);
     }
+    assert_eq!(
+        call(json!({"op":"unlock","session":session,"partition":1,
+        "mode":"none","cache":{"plaintext_page_kib":8192}}))["ok"],
+        false
+    );
+    assert_eq!(read()["data"], before["data"]);
     assert_eq!(call(json!({"op":"close","session":session}))["ok"], true);
 }

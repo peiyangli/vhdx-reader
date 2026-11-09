@@ -11,6 +11,7 @@ import 'package:path_provider/path_provider.dart';
 import 'backend.dart';
 import 'cache_settings.dart';
 import 'media_preview.dart';
+import 'media_open_control.dart';
 import 'preview.dart' show isImage, isVideo, extension;
 import 'range_reader.dart';
 
@@ -119,10 +120,13 @@ class _Job {
   final String key;
   final String diskKey;
   final done = Completer<Thumbnail?>();
+  final stopped = Completer<void>();
+  final clock = Stopwatch()..start();
   final cleanups = <Future<void> Function()>[];
   int listeners = 0;
   bool cancelled = false;
   bool timedOut = false;
+  bool knownUnavailable = false;
   bool get video => isVideo(entry['name'] as String);
   bool get valid => !cancelled && scope.available;
   void check() {
@@ -132,7 +136,8 @@ class _Job {
   void cancel() {
     if (cancelled) return;
     cancelled = true;
-    for (final cleanup in cleanups) {
+    stopped.complete();
+    for (final cleanup in cleanups.toList()) {
       unawaited(cleanup().catchError((Object _) {}));
     }
   }
@@ -144,7 +149,10 @@ class ThumbnailCache extends ChangeNotifier {
     this.settings = const CacheSettings(),
     this.directory,
     this.onError,
+    this.onTrace,
+    @visibleForTesting this.generationTimeout = const Duration(seconds: 8),
     @visibleForTesting this.generator,
+    @visibleForTesting this.videoTransport,
     int? memoryLimit,
     this.diskLimit = 256 * 1024 * 1024,
   }) : memoryLimit =
@@ -153,6 +161,9 @@ class ThumbnailCache extends ChangeNotifier {
   CacheSettings settings;
   final Directory? directory;
   final void Function(Object)? onError;
+  final void Function(Map<String, dynamic>)? onTrace;
+  final Duration generationTimeout;
+  final String? videoTransport;
   final Future<Thumbnail?> Function(
     ThumbnailScope,
     String,
@@ -171,6 +182,7 @@ class ThumbnailCache extends ChangeNotifier {
   int _bytes = 0;
   int _running = 0;
   int _videos = 0;
+  int _retiring = 0;
   int _diskEpoch = 0;
   bool _disposed = false;
   Future<void> _diskTail = Future.value();
@@ -211,11 +223,11 @@ class ThumbnailCache extends ChangeNotifier {
   }
 
   Future<void> _trimDisk(Directory root) async {
-    if (_diskBytes <= diskLimit) return;
+    if (_diskBytes <= diskLimit && _diskEntries!.length <= 10000) return;
     final entries = _diskEntries!.entries.toList()
       ..sort((a, b) => a.value.used.compareTo(b.value.used));
     for (final entry in entries) {
-      if (_diskBytes <= diskLimit) break;
+      if (_diskBytes <= diskLimit && _diskEntries!.length <= 10000) break;
       final file = File('${root.path}/${entry.key}');
       if (await file.exists()) await file.delete();
       _forgetDisk(entry.key);
@@ -317,13 +329,16 @@ class ThumbnailCache extends ChangeNotifier {
   String _key(ThumbnailScope scope, String hash) =>
       '${identityHashCode(scope)}:${scope.generation}:$hash';
 
+  String _diskKey(ThumbnailScope scope, String hash) =>
+      '${scope.encrypted ? 'b' : 'p'}-$hash.thumb';
+
   Duration? retryDelay(
     ThumbnailScope scope,
     String path,
     Map<String, dynamic> entry,
   ) {
     if (_disposed || !scope.available) return null;
-    final failure = _failures[_key(scope, _hash(scope, path, entry))];
+    final failure = _failures[_diskKey(scope, _hash(scope, path, entry))];
     if (failure == null || failure.terminal || failure.attempts >= 3) {
       return null;
     }
@@ -348,7 +363,7 @@ class ThumbnailCache extends ChangeNotifier {
       _memory[key] = hit;
       return ThumbnailRequest(Future.value(hit.clone()), () {});
     }
-    final failure = _failures[key];
+    final failure = _failures[_diskKey(scope, hash)];
     if (failure != null &&
         (failure.terminal ||
             DateTime.now().difference(failure.at) <
@@ -363,13 +378,7 @@ class ThumbnailCache extends ChangeNotifier {
     }
     var job = _jobs[key];
     if (job == null || job.cancelled) {
-      job = _Job(
-        scope,
-        path,
-        entry,
-        key,
-        '${scope.encrypted ? 'b' : 'p'}-$hash.thumb',
-      );
+      job = _Job(scope, path, entry, key, _diskKey(scope, hash));
       _jobs[key] = job;
       _lookupQueue.add(job);
       scheduleMicrotask(_pump);
@@ -406,7 +415,7 @@ class ThumbnailCache extends ChangeNotifier {
         }),
       );
     }
-    while (_running < 2) {
+    while (_running < 2 && _retiring < 2) {
       final choices = _queue.where((job) => !job.video || _videos == 0);
       if (choices.isEmpty) break;
       final job = choices.first;
@@ -438,6 +447,8 @@ class ThumbnailCache extends ChangeNotifier {
       if (value != null) {
         _publish(job, value);
         value = null;
+      } else if (job.knownUnavailable) {
+        job.done.complete();
       } else {
         _queue.add(job);
       }
@@ -456,20 +467,58 @@ class ThumbnailCache extends ChangeNotifier {
     _memory[job.key] = value;
     _owners[job.key] = job.scope;
     _bytes += size;
-    _failures.remove(job.key);
+    _failures.remove(job.diskKey);
     job.done.complete(value);
   }
 
   Future<void> _run(_Job job) async {
     Thumbnail? value;
-    final timer = Timer(const Duration(seconds: 8), () {
+    var outcome = 'failed';
+    final queuedMs = job.clock.elapsedMilliseconds;
+    final timer = Timer(generationTimeout, () {
       job.timedOut = true;
       job.cancel();
     });
     try {
-      value = await (generator == null
+      var abandoned = false;
+      var finished = false;
+      Thumbnail? produced;
+      final generation = (generator == null
           ? _generate(job)
           : generator!(job.scope, job.path, job.entry));
+      final guarded = generation
+          .then((result) {
+            if (abandoned) {
+              result?.dispose();
+              return null;
+            }
+            produced = result;
+            return result;
+          })
+          .whenComplete(() {
+            finished = true;
+            if (abandoned) {
+              _retiring--;
+              _pump();
+            }
+          });
+      try {
+        value = await Future.any<Thumbnail?>([
+          guarded,
+          job.stopped.future.then<Thumbnail?>(
+            (_) => throw StateError('Cancelled thumbnail'),
+          ),
+        ]);
+        produced = null; // Ownership transferred to value.
+      } finally {
+        if (finished) {
+          produced?.dispose();
+        }
+        if (!finished) {
+          abandoned = true;
+          _retiring++;
+        }
+      }
       job.check();
       if (value != null) {
         // Display the decoded frame before encoding/writing a persistent copy.
@@ -477,6 +526,7 @@ class ThumbnailCache extends ChangeNotifier {
         timer.cancel();
         final persistent = value.clone();
         _publish(job, value);
+        outcome = 'ready';
         value = null;
         try {
           await _writeDisk(job, persistent);
@@ -484,7 +534,7 @@ class ThumbnailCache extends ChangeNotifier {
           persistent.dispose();
         }
       } else {
-        _rememberFailure(job.key);
+        _recordFailure(job, terminal: true);
         job.done.complete();
       }
     } catch (error) {
@@ -495,12 +545,46 @@ class ThumbnailCache extends ChangeNotifier {
       }
       if (!job.done.isCompleted &&
           (job.valid || (job.timedOut && job.scope.available))) {
-        _rememberFailure(job.key, terminal: error is _UnsupportedThumbnail);
+        _recordFailure(job, terminal: job.timedOut || _terminalFailure(error));
       }
       if (!job.done.isCompleted) job.done.complete();
     } finally {
       timer.cancel();
       value?.dispose();
+      _trace(job, {
+        'phase': 'generation',
+        'outcome': outcome,
+        'queue_ms': queuedMs,
+        'elapsed_ms': job.clock.elapsedMilliseconds,
+        'timed_out': job.timedOut,
+        'cancelled': job.cancelled,
+      });
+    }
+  }
+
+  void _trace(_Job job, Map<String, dynamic> value) {
+    try {
+      onTrace?.call({'key': job.key, ...value});
+    } catch (_) {}
+  }
+
+  bool _terminalFailure(Object error) {
+    // Device/session/queue failures do not establish that a file is undecodable.
+    if (error is ReaderFailure) {
+      return !error.invalidated &&
+          const {
+            'unsupported',
+            'thumbnail_read_budget',
+            'thumbnail_deadline',
+          }.contains(error.code);
+    }
+    return true; // Decoder/format failure, including _UnsupportedThumbnail.
+  }
+
+  void _recordFailure(_Job job, {required bool terminal}) {
+    _rememberFailure(job.diskKey, terminal: terminal);
+    if (terminal) {
+      unawaited(_writeDiskEntry(job, {'unavailable': true}, failure: true));
     }
   }
 
@@ -553,6 +637,11 @@ class ThumbnailCache extends ChangeNotifier {
       if (data == null || epoch != _diskEpoch || !_persistent(job.scope)) {
         return null;
       }
+      if (data['unavailable'] == true) {
+        job.knownUnavailable = true;
+        _rememberFailure(job.diskKey, terminal: true);
+        return null;
+      }
       final image = await _decode(base64Decode(data['png'] as String));
       return Thumbnail(image, Duration(milliseconds: data['duration'] as int));
     } catch (_) {
@@ -564,11 +653,29 @@ class ThumbnailCache extends ChangeNotifier {
     if (!_persistent(job.scope)) return;
     final epoch = _diskEpoch;
     final bytes = await value.image.toByteData(format: ui.ImageByteFormat.png);
-    if (bytes == null) return;
+    if (bytes == null || epoch != _diskEpoch) return;
+    await _writeDiskEntry(job, {
+      'png': base64Encode(bytes.buffer.asUint8List()),
+      'duration': value.duration.inMilliseconds,
+    });
+  }
+
+  Future<void> _writeDiskEntry(
+    _Job job,
+    Map<String, dynamic> data, {
+    bool failure = false,
+  }) async {
+    if (!_persistent(job.scope)) return;
+    final epoch = _diskEpoch;
+    bool current() =>
+        !_disposed &&
+        job.scope.available &&
+        (!job.cancelled || (failure && job.timedOut)) &&
+        epoch == _diskEpoch &&
+        _persistent(job.scope);
     try {
       await _disk(() async {
-        job.check();
-        if (epoch != _diskEpoch || !_persistent(job.scope)) return;
+        if (!current()) return;
         final root = await _root();
         await root.create(recursive: true);
         await _indexDisk(root);
@@ -576,13 +683,9 @@ class ThumbnailCache extends ChangeNotifier {
         if (_diskEntries!.containsKey(job.diskKey)) return;
         final temporary = File('${destination.path}.tmp');
         try {
-          final encoded = jsonEncode({
-            'png': base64Encode(bytes.buffer.asUint8List()),
-            'duration': value.duration.inMilliseconds,
-          });
+          final encoded = jsonEncode(data);
           await temporary.writeAsString(encoded);
-          job.check();
-          if (epoch != _diskEpoch || !_persistent(job.scope)) return;
+          if (!current()) return;
           await temporary.rename(destination.path);
           _diskEntries![job.diskKey] = (
             size: encoded.length,
@@ -626,53 +729,73 @@ class ThumbnailCache extends ChangeNotifier {
 
   Future<Thumbnail?> _generate(_Job job) async {
     if (job.video) {
-      var unsupportedCodec = false;
-      final media = await MediaPreviewSource.open(
-        job.scope.backend,
-        job.path,
-        thumbnail: true,
-        onDiagnostic: (error) {
-          if (error.toString().contains(
-            'Failed to initialize a decoder for codec',
-          )) {
-            unsupportedCodec = true;
-          }
-          onError?.call(error);
-        },
-      );
-      Future<void> close() async {
-        media.dispose();
-        await media.closed;
+      final control = MediaOpenControl();
+      Future<void> abort() async {
+        control.cancel();
       }
 
-      job.cleanups.add(close);
+      // Install BEFORE task creation/media_open, including cancellation while
+      // the Rust worker is opening the file or mpv is initializing its output.
+      job.cleanups.add(abort);
+      final clock = Stopwatch()..start();
+      var openMs = 0;
+      var screenshotMs = 0;
+      int? firstFrameMs;
+      MediaPreviewSource? media;
       try {
         job.check();
+        media = await MediaPreviewSource.open(
+          job.scope.backend,
+          job.path,
+          thumbnail: true,
+          transport: videoTransport,
+          cancellation: control,
+          onReadTrace: onTrace == null
+              ? null
+              : (stats) => _trace(job, {'phase': 'reads', ...stats}),
+          onDiagnostic: onError,
+        );
+        openMs = clock.elapsedMilliseconds;
+        job.check();
+        unawaited(
+          media.controller.waitUntilFirstFrameRendered.then((_) {
+            firstFrameMs ??= clock.elapsedMilliseconds;
+          }),
+        );
         await media.player.pause();
-        for (var attempt = 0; attempt < 40; attempt++) {
+        while (true) {
           job.check();
-          // Actual end-file failure is terminal for this attempt. Avoid spending
-          // the entire polling budget on an unsupported codec or failed open.
-          if (media.error != null) {
-            if (unsupportedCodec) throw _UnsupportedThumbnail();
-            return null;
+          if (media.error != null) throw _UnsupportedThumbnail();
+          final stats = await media.statistics();
+          final budget = stats['thumbnail'] as Map?;
+          if (budget != null && budget['reason'] != 'active') {
+            throw ReaderFailure('thumbnail_${budget['reason']}', '缩略图达到限制。');
           }
-          // The first decoded frame avoids an extra seek (Android recreates
-          // its output surface during startup, which already reopens HTTP).
-          if ((await media.statistics())['bytes'] as int > 32 * 1024 * 1024) {
-            onError?.call(StateError('thumbnail_read_budget'));
-            return null;
-          }
+          final shot = Stopwatch()..start();
           final bytes = await media.player.screenshot(format: 'image/jpeg');
+          screenshotMs += shot.elapsedMilliseconds;
           if (bytes != null) {
+            job.check();
+            firstFrameMs ??= clock.elapsedMilliseconds;
             return Thumbnail(await _decode(bytes), media.duration);
           }
           await Future<void>.delayed(const Duration(milliseconds: 100));
         }
-        return null;
       } finally {
-        job.cleanups.remove(close);
-        await close();
+        control.cancel();
+        final closing = Stopwatch()..start();
+        if (media != null) {
+          media.dispose();
+          await media.closed;
+        }
+        job.cleanups.remove(abort);
+        _trace(job, {
+          'phase': 'video',
+          'open_ms': openMs,
+          'first_frame_ms': firstFrameMs,
+          'screenshot_ms': screenshotMs,
+          'close_ms': closing.elapsedMilliseconds,
+        });
       }
     }
     if (!isImage(job.entry['name'] as String) ||

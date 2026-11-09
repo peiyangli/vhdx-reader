@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 
 const CHUNK: usize = 256 * 1024;
 struct Shared {
+    task: Option<Arc<crate::thumbnail::Task>>,
     closed: AtomicBool,
     sockets: Mutex<HashMap<u64, TcpStream>>,
     active: AtomicUsize,
@@ -25,6 +26,11 @@ struct Shared {
     ranges: AtomicU64,
 }
 impl Shared {
+    fn stopped(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+            || self.task.as_ref().is_some_and(|t| t.check().is_err())
+    }
+
     fn shutdown(&self) {
         self.closed.store(true, Ordering::Release);
         if let Ok(sockets) = self.sockets.lock() {
@@ -44,7 +50,17 @@ impl Drop for Stream {
     }
 }
 impl Stream {
+    #[cfg(test)]
     pub fn start(context: u64, session: u64, file: u64, size: u64) -> Result<Self> {
+        Self::start_task(context, session, file, size, None)
+    }
+    pub fn start_task(
+        context: u64,
+        session: u64,
+        file: u64,
+        size: u64,
+        task: Option<Arc<crate::thumbnail::Task>>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;
         let host = listener.local_addr()?.to_string();
@@ -57,6 +73,7 @@ impl Stream {
         );
         let url = format!("http://{host}{path}");
         let shared = Arc::new(Shared {
+            task,
             closed: AtomicBool::new(false),
             sockets: Mutex::new(HashMap::new()),
             active: AtomicUsize::new(0),
@@ -69,7 +86,7 @@ impl Stream {
         thread::Builder::new()
             .name("vhdx-media-http".into())
             .spawn(move || {
-                while !server.closed.load(Ordering::Acquire) {
+                while !server.stopped() {
                     match listener.accept() {
                         Ok((mut socket, peer)) => {
                             if !peer.ip().is_loopback() {
@@ -119,9 +136,22 @@ impl Stream {
                                         size,
                                         &shared,
                                         |offset, length| {
-                                            crate::read_media(
-                                                context, session, file, offset, length,
-                                            )
+                                            if let Some(task) = &shared.task {
+                                                crate::read_media_task(
+                                                    context,
+                                                    session,
+                                                    file,
+                                                    offset,
+                                                    length,
+                                                    &task.cancel,
+                                                    &task.cancel,
+                                                    Some(task),
+                                                )
+                                            } else {
+                                                crate::read_media(
+                                                    context, session, file, offset, length,
+                                                )
+                                            }
                                         },
                                     );
                                     let _ = socket.shutdown(Shutdown::Both);
@@ -143,6 +173,7 @@ impl Stream {
                         Err(_) => break,
                     }
                 }
+                server.shutdown();
             })?;
         Ok(Self { shared, url })
     }
@@ -208,7 +239,7 @@ fn serve(
     let started = Instant::now();
     let mut raw = Vec::with_capacity(1024);
     while !raw.ends_with(b"\r\n\r\n") {
-        if shared.closed.load(Ordering::Acquire) {
+        if shared.stopped() {
             return Ok(());
         }
         if raw.len() >= 8192 || started.elapsed() > Duration::from_secs(5) {
@@ -286,7 +317,7 @@ fn serve(
     } else {
         None
     };
-    if shared.closed.load(Ordering::Acquire) {
+    if shared.stopped() {
         return Ok(());
     }
     write!(socket, "HTTP/1.1 {code}\r\nContent-Type: application/octet-stream\r\nContent-Length: {length}\r\nAccept-Ranges: bytes\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n{extra}\r\n")?;
@@ -294,7 +325,7 @@ fn serve(
         return Ok(());
     }
     let mut done = 0;
-    while done < length && !shared.closed.load(Ordering::Acquire) {
+    while done < length && !shared.stopped() {
         let wanted = (length - done).min(CHUNK as u64) as usize;
         let bytes = match first
             .take()
@@ -304,7 +335,7 @@ fn serve(
             Ok(bytes) if bytes.len() == wanted => bytes,
             _ => break, // Truncated HTTP body signals a read failure to the player.
         };
-        if shared.closed.load(Ordering::Acquire) {
+        if shared.stopped() {
             break;
         }
         socket.write_all(&bytes)?;

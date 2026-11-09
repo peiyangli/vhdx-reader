@@ -13,6 +13,9 @@ import 'package:media_kit_video/media_kit_video.dart';
 // ignore: implementation_imports
 import 'package:media_kit_video/src/video_controller/android_video_controller/android_video_controller.dart';
 import 'backend.dart';
+import 'native_media.dart';
+import 'media_open_control.dart';
+import 'playback_buffer_settings.dart';
 
 class MediaPreviewSource extends ChangeNotifier {
   MediaPreviewSource._(
@@ -21,6 +24,8 @@ class MediaPreviewSource extends ChangeNotifier {
     this.player,
     this.controller,
     this._ownsPlaybackSession,
+    this._thumbnailTask,
+    this._openControl,
   ) {
     _subscriptions.addAll([
       player.stream.position.listen((value) {
@@ -49,6 +54,8 @@ class MediaPreviewSource extends ChangeNotifier {
   MediaPlaybackEvents? _playbackEvents;
   bool _playbackFailed = false;
   final bool _ownsPlaybackSession;
+  final ThumbnailReadTask? _thumbnailTask;
+  final MediaOpenControl? _openControl;
   bool get audioOutputAvailable => !Platform.isIOS || _ownsPlaybackSession;
   final ReaderBackend backend;
   final int file;
@@ -71,13 +78,46 @@ class MediaPreviewSource extends ChangeNotifier {
     ReaderBackend backend,
     String path, {
     bool thumbnail = false,
+    PlaybackBufferSettings bufferSettings = const PlaybackBufferSettings(),
+    String? transport,
+    MediaOpenControl? cancellation,
+    void Function(Map<String, dynamic>)? onReadTrace,
     void Function(Object)? onDiagnostic,
   }) async {
-    final media = await backend.request({'op': 'media_open', 'path': path});
+    if (!thumbnail && !bufferSettings.valid) {
+      throw ArgumentError.value(bufferSettings, 'bufferSettings');
+    }
+    // Playback and thumbnails use the same native callback by default.
+    // HTTP remains an explicit diagnostic/comparison override only.
+    final selected =
+        transport ??
+        const String.fromEnvironment(
+          'VHDX_MEDIA_TRANSPORT',
+          defaultValue: 'native',
+        );
+    if (selected != 'http' && selected != 'native') {
+      throw ArgumentError.value(selected, 'transport');
+    }
+    cancellation?.check();
+    final task = thumbnail
+        ? ThumbnailReadTask(backend, cancellation, onReadTrace)
+        : null;
+    late final Map<String, dynamic> media;
+    var mediaOpened = false;
     Player? player;
     MediaPreviewSource? source;
     var audioAcquired = false;
     try {
+      await task?.begin();
+      cancellation?.check();
+      media = await backend.request({
+        'op': 'media_open',
+        'path': path,
+        if (selected != 'http') 'transport': selected,
+        if (task != null) 'thumbnail_task': task.id,
+      });
+      mediaOpened = true;
+      cancellation?.check();
       if (Platform.isIOS && !thumbnail) {
         audioAcquired = await PlatformStorage.beginPlayback();
       }
@@ -86,8 +126,10 @@ class MediaPreviewSource extends ChangeNotifier {
         configuration: PlayerConfiguration(
           title: 'VHDX Reader',
           logLevel: MPVLogLevel.error,
-          bufferSize: (thumbnail ? 1 : 8) * 1024 * 1024,
-          protocolWhitelist: ['http', 'tcp'],
+          // Packet buffering is independent of the volume read cache. Allow
+          // external/encrypted sources to absorb latency and bitrate bursts.
+          bufferSize: (thumbnail ? 1 : bufferSettings.forwardMiB) * 1024 * 1024,
+          protocolWhitelist: selected == 'native' ? ['vhdx'] : ['http', 'tcp'],
         ),
       );
       final controller = VideoController(
@@ -103,11 +145,23 @@ class MediaPreviewSource extends ChangeNotifier {
               )
             : const VideoControllerConfiguration(),
       );
+      source = MediaPreviewSource._(
+        backend,
+        media['file'] as int,
+        player,
+        controller,
+        audioAcquired,
+        task,
+        cancellation,
+      );
+      cancellation?.add(source.dispose);
+      cancellation?.check();
       // Controller initialization is deferred to a frame. Lazy thumbnails can
       // start while the browser is idle, so explicitly request that frame.
       WidgetsBinding.instance.scheduleFrame();
       final native = player.platform;
       if (native is! NativePlayer) throw StateError('Native player required');
+      if (selected == 'native') await NativeMedia.register(native);
       if (thumbnail || (Platform.isIOS && !audioAcquired)) {
         await native.setProperty('ao', 'null');
       }
@@ -125,21 +179,30 @@ class MediaPreviewSource extends ChangeNotifier {
         'demuxer-max-back-bytes',
         '${thumbnail ? 0 : 2 * 1024 * 1024}',
       );
-      await native.setProperty('cache-secs', thumbnail ? '0' : '5');
+      await native.setProperty(
+        'cache-secs',
+        '${thumbnail ? 0 : bufferSettings.readAheadSeconds}',
+      );
       if (thumbnail) {
         await native.setProperty('cache', 'no');
         await native.setProperty('demuxer-readahead-secs', '0');
+      } else {
+        // Refill before starting or resuming after a seek/underrun instead of
+        // repeatedly playing a small burst. mpv resumes earlier at EOF or the
+        // byte limit, so short clips and high-bitrate streams can still start.
+        await native.setProperty('cache', 'yes');
+        await native.setProperty('cache-pause', 'yes');
+        await native.setProperty(
+          'cache-pause-wait',
+          '${bufferSettings.resumeSeconds}',
+        );
+        await native.setProperty('cache-pause-initial', 'yes');
       }
       await native.setProperty('access-references', 'no');
       await native.setProperty('sub-auto', 'no');
       await native.setProperty('audio-file-auto', 'no');
-      source = MediaPreviewSource._(
-        backend,
-        media['file'] as int,
-        player,
-        controller,
-        audioAcquired,
-      );
+      cancellation?.check();
+
       if (onDiagnostic != null) {
         source._subscriptions.add(player.stream.error.listen(onDiagnostic));
       }
@@ -163,13 +226,20 @@ class MediaPreviewSource extends ChangeNotifier {
           opened._changed();
         },
       );
+      cancellation?.check();
       // add uses loadfile directly; open writes a temporary playlist to disk.
       await player.add(Media(media['url'] as String));
       await native.setProperty('playlist-pos', '0');
+      cancellation?.check();
       return source;
     } catch (error) {
+      try {
+        onDiagnostic?.call(error);
+      } catch (_) {}
+      task?.cancel();
       if (source != null) {
         source.dispose();
+        if (thumbnail) await source.closed;
       } else {
         if (player != null) {
           try {
@@ -182,10 +252,16 @@ class MediaPreviewSource extends ChangeNotifier {
           } catch (_) {}
         }
         try {
-          await backend.request({'op': 'media_close', 'file': media['file']});
+          if (mediaOpened) {
+            await backend.request({'op': 'media_close', 'file': media['file']});
+          }
         } catch (_) {}
+        await task?.finish();
       }
-      if (error is ReaderFailure && error.invalidated) rethrow;
+      if (error is ReaderFailure &&
+          (error.invalidated || error.code.startsWith('thumbnail_'))) {
+        rethrow;
+      }
       throw ReaderFailure('media', '无法启动播放器，请完整解压程序并检查视频格式。');
     }
   }
@@ -304,6 +380,8 @@ class MediaPreviewSource extends ChangeNotifier {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _openControl?.remove(dispose);
+    _thumbnailTask?.cancel();
     _playbackEvents?.dispose();
     for (final subscription in _subscriptions) {
       unawaited(subscription.cancel());
@@ -319,6 +397,7 @@ class MediaPreviewSource extends ChangeNotifier {
           try {
             await _disposePlayer();
           } finally {
+            await _thumbnailTask?.finish();
             if (_ownsPlaybackSession) await PlatformStorage.endPlayback();
           }
         })

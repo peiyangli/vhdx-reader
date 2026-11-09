@@ -18,7 +18,13 @@ void main() {
       );
       addTearDown(() => directory.delete(recursive: true));
       final store = CacheSettingsStore(directory: directory);
-      await store.save(const CacheSettings(plaintextMiB: 64, ciphertextMiB: 4));
+      await store.save(
+        const CacheSettings(
+          plaintextMiB: 16384,
+          plaintextPageKiB: 1024,
+          ciphertextMiB: 4,
+        ),
+      );
       final settings = await CacheSettingsStore(directory: directory).load();
       final root = fixtureSetting('VHDX_SAMPLE_DIR')!;
       final backend = await NativeBackend.start();
@@ -34,8 +40,11 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('can.txt'), findsOneWidget);
       await openReaderSettings(tester);
-      await tester.ensureVisible(find.byKey(const Key('cache-plaintext')));
-      expect(find.text('64 MiB / 卷'), findsOneWidget);
+      await ensureReaderSettingVisible(
+        tester,
+        find.byKey(const Key('cache-plaintext')),
+      );
+      expect(find.text('16 GiB / 卷'), findsOneWidget);
       await tester.tap(find.byKey(const Key('cache-plaintext')));
       await tester.pumpAndSettle();
       await tester.ensureVisible(find.byKey(const Key('cache-plaintext-128')));
@@ -51,6 +60,7 @@ void main() {
       }
       expect(find.text('128 MiB / 卷'), findsOneWidget);
       expect((await store.load()).plaintextMiB, 128);
+      expect((await store.load()).plaintextPageKiB, 1024);
       await tester.tap(find.byKey(const Key('settings-back')));
       await tester.pumpAndSettle();
       await tester.tap(find.text('can.txt'));

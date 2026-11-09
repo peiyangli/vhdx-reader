@@ -17,6 +17,7 @@ import 'window_chrome.dart';
 import 'reader_navigation.dart';
 import 'screen_layout.dart';
 import 'cache_settings.dart';
+import 'file_disk_cache.dart';
 import 'thumbnails.dart';
 import 'recent_images.dart';
 import 'browser_settings.dart';
@@ -141,6 +142,7 @@ class ReaderApp extends StatelessWidget {
     this.pickImages,
     this.platform,
     this.cacheSettings = const CacheSettings(),
+    this.fileDiskCache = const FileDiskCache(),
     this.saveCacheSettings,
     this.browserSettings = const BrowserSettings(),
     this.saveBrowserSettings,
@@ -150,6 +152,7 @@ class ReaderApp extends StatelessWidget {
   final Future<void> Function(BrowserSettings)? saveBrowserSettings;
   final RecentImagesStore? recents;
   final CacheSettings cacheSettings;
+  final FileDiskCache fileDiskCache;
   final Future<void> Function(CacheSettings)? saveCacheSettings;
   final TargetPlatform? platform;
   final ReaderBackend backend;
@@ -172,6 +175,7 @@ class ReaderApp extends StatelessWidget {
       platform: platform ?? readerTheme().platform,
       cacheSettings: cacheSettings,
       saveCacheSettings: saveCacheSettings ?? const CacheSettingsStore().save,
+      fileDiskCache: fileDiskCache,
       recents: recents,
       browserSettings: browserSettings,
       saveBrowserSettings: saveBrowserSettings,
@@ -197,12 +201,14 @@ class _ReaderWorkspace extends StatefulWidget {
     required this.platform,
     required this.cacheSettings,
     required this.saveCacheSettings,
+    required this.fileDiskCache,
     required this.browserSettings,
     this.saveBrowserSettings,
     this.recents,
   });
   final CacheSettings cacheSettings;
   final Future<void> Function(CacheSettings) saveCacheSettings;
+  final FileDiskCache fileDiskCache;
   final BrowserSettings browserSettings;
   final Future<void> Function(BrowserSettings)? saveBrowserSettings;
   final RecentImagesStore? recents;
@@ -385,22 +391,107 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
   bool _shakeBusy = false;
   late CacheSettings _cacheSettings = widget.cacheSettings;
   bool _cacheSettingsBusy = false;
+  bool _diskCacheReady = false;
+  String? _diskCacheError;
+  Future<void> _initializeDiskCache() async {
+    try {
+      await widget.fileDiskCache.configure(
+        widget.backend,
+        _cacheSettings.disk,
+        cacheEnabled: _cacheSettings.enabled,
+      );
+    } catch (_) {
+      _diskCacheError = '磁盘缓存暂不可用，文件仍可读取。请检查本机存储后重新保存设置。';
+    } finally {
+      if (mounted) setState(() => _diskCacheReady = true);
+    }
+  }
 
-  Future<void> _setCacheSettings(CacheSettings value) async {
+  Future<void> _clearFileDiskCache() async {
     if (_cacheSettingsBusy) return;
     setState(() => _cacheSettingsBusy = true);
     try {
-      await _thumbnails.configure(value);
-      await widget.saveCacheSettings(value);
+      await widget.fileDiskCache.clear(
+        widget.backend,
+        _cacheSettings.disk,
+        cacheEnabled: _cacheSettings.enabled,
+      );
       if (!mounted) return;
-      setState(() => _cacheSettings = value);
+      setState(() => _diskCacheError = null);
       ScaffoldMessenger.of(context)
         ..clearSnackBars()
         ..showSnackBar(
-          const SnackBar(content: Text('已保存。缩略图设置立即生效，读取缓存重新解锁或打开镜像后生效。')),
+          const SnackBar(content: Text('文件磁盘缓存已清空。开启缓存时，后续读取会重新缓存。')),
         );
     } catch (_) {
-      await _thumbnails.configure(_cacheSettings);
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+          ..clearSnackBars()
+          ..showSnackBar(const SnackBar(content: Text('无法完全清空文件磁盘缓存，请重试。')));
+      }
+    } finally {
+      if (mounted) setState(() => _cacheSettingsBusy = false);
+    }
+  }
+
+  Future<void> _setCacheSettings(CacheSettings value) async {
+    if (_cacheSettingsBusy) return;
+    final diskChanged =
+        value.enabled != _cacheSettings.enabled ||
+        value.disk.enabled != _cacheSettings.disk.enabled ||
+        value.disk.maxGiB != _cacheSettings.disk.maxGiB ||
+        value.disk.retentionDays != _cacheSettings.disk.retentionDays ||
+        _diskCacheError != null;
+    final thumbnailsChanged =
+        value.thumbnailDisk != _cacheSettings.thumbnailDisk ||
+        value.bitLockerThumbnailDisk != _cacheSettings.bitLockerThumbnailDisk;
+    final playbackChanged =
+        value.playback.forwardMiB != _cacheSettings.playback.forwardMiB ||
+        value.playback.readAheadSeconds !=
+            _cacheSettings.playback.readAheadSeconds ||
+        value.playback.resumeSeconds != _cacheSettings.playback.resumeSeconds;
+    setState(() => _cacheSettingsBusy = true);
+    try {
+      if (diskChanged) {
+        await widget.fileDiskCache.configure(
+          widget.backend,
+          value.disk,
+          cacheEnabled: value.enabled,
+        );
+      }
+      if (thumbnailsChanged) await _thumbnails.configure(value);
+      await widget.saveCacheSettings(value);
+      if (!mounted) return;
+      setState(() {
+        _cacheSettings = value;
+        _diskCacheError = null;
+      });
+      ScaffoldMessenger.of(context)
+        ..clearSnackBars()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(
+              diskChanged
+                  ? '已保存。文件缓存开关与磁盘策略已生效，已有磁盘文件保留，可手动清空。'
+                  : playbackChanged
+                  ? '已保存。播放器缓冲下次打开视频时生效。'
+                  : '已保存。缩略图设置立即生效，读取缓存重新解锁或打开镜像后生效。',
+            ),
+          ),
+        );
+    } catch (_) {
+      if (diskChanged) {
+        try {
+          await widget.fileDiskCache.configure(
+            widget.backend,
+            _cacheSettings.disk,
+            cacheEnabled: _cacheSettings.enabled,
+          );
+        } catch (_) {
+          _diskCacheError = '磁盘缓存暂不可用，请检查本机存储后重试。';
+        }
+      }
+      if (thumbnailsChanged) await _thumbnails.configure(_cacheSettings);
       if (mounted) {
         ScaffoldMessenger.of(context)
           ..clearSnackBars()
@@ -414,6 +505,7 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
   @override
   void initState() {
     super.initState();
+    unawaited(_initializeDiskCache());
     setDesktopWindowHandler(_windowEvent);
     _recents.addListener(_recentsChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -694,7 +786,10 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
         child: IndexedStack(
           index: _settingsOpen ? 1 : 0,
           children: [
-            _homes(),
+            if (_diskCacheReady)
+              _homes()
+            else
+              const Center(child: CircularProgressIndicator()),
             if (_settingsOpen)
               ReaderSettingsPage(
                 key: const Key('reader-settings-page'),
@@ -707,6 +802,10 @@ class _ReaderWorkspaceState extends State<_ReaderWorkspace>
                 cacheSettings: _cacheSettings,
                 onCacheSettings: _cacheSettingsBusy ? null : _setCacheSettings,
                 onClearThumbnails: _clearThumbnails,
+                onClearFileDiskCache: _cacheSettingsBusy
+                    ? null
+                    : _clearFileDiskCache,
+                diskCacheError: _diskCacheError,
                 windowsChrome: false,
                 direction:
                     widget.platform == TargetPlatform.android ||
@@ -1185,7 +1284,11 @@ class _ReaderHomeState extends State<ReaderHome> {
       PdfPreviewSource? pdf;
       MediaPreviewSource? media;
       if (isVideo(name)) {
-        media = await MediaPreviewSource.open(widget.backend, _join(name));
+        media = await MediaPreviewSource.open(
+          widget.backend,
+          _join(name),
+          bufferSettings: widget.cacheSettings.playback,
+        );
         if (!mounted || revision != _previewRevision) {
           media.dispose();
           return;

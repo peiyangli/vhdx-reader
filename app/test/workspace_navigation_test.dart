@@ -159,6 +159,10 @@ void main() {
             .value,
         true,
       );
+      await ensureReaderSettingVisible(
+        tester,
+        find.byKey(const Key('credential-manager')),
+      );
       await tester.tap(find.byKey(const Key('credential-manager')));
       await tester.pumpAndSettle();
       expect(find.byType(Dialog), findsOneWidget);

@@ -144,20 +144,19 @@ void main() {
         }
         if (pass == 1) {
           expect(
-            backend.mediaPaths.where((p) => p != '/video/rmvb.rmvb').length,
+            backend.mediaPaths.length,
             generatedBeforeReopen,
-            reason: 'Reopened cache must not start any decoder',
+            reason:
+                'Reopened cache must skip successful and unsupported videos',
           );
         }
-        generatedBeforeReopen = backend.mediaPaths
-            .where((p) => p != '/video/rmvb.rmvb')
-            .length;
+        generatedBeforeReopen = backend.mediaPaths.length;
         for (var i = 0; i < 100; i++) {
           if ((await directory.list().toList())
                   .whereType<File>()
                   .where((f) => f.path.endsWith('.thumb'))
                   .length ==
-              expected) {
+              entries.length) {
             break;
           }
           await Future<void>.delayed(const Duration(milliseconds: 10));
@@ -167,7 +166,16 @@ void main() {
               .whereType<File>()
               .where((f) => f.path.endsWith('.thumb'))
               .length,
-          expected,
+          entries.length,
+        );
+        final records = await Future.wait(
+          (await directory.list().toList()).whereType<File>().map(
+            (file) async => jsonDecode(await file.readAsString()) as Map,
+          ),
+        );
+        expect(
+          records.where((record) => record['unavailable'] == true).length,
+          1,
         );
         if (pass == 1) expect(clock.elapsedMilliseconds, lessThan(2000));
         await tester.pumpWidget(const SizedBox.shrink());

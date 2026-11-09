@@ -1,5 +1,6 @@
 //! Read-only, thread-confined disk-image sessions. Native handles never cross threads.
 pub mod credentials;
+pub mod disk_cache;
 pub mod native;
 pub mod partition;
 pub mod session;

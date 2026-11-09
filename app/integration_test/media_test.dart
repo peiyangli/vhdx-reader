@@ -6,6 +6,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:vhdx_reader/backend.dart';
+import 'package:vhdx_reader/cache_settings.dart';
+import 'package:vhdx_reader/playback_buffer_settings.dart';
 import 'package:vhdx_reader/main.dart';
 import 'package:vhdx_reader/media_preview.dart';
 import 'package:vhdx_reader/preview.dart';
@@ -26,11 +28,26 @@ void main() {
     (tester) async {
       final fixture = fixtureSetting('VHDX_MEDIA_FIXTURE');
       expect(fixture, isNotNull);
+      final settingsDirectory = await Directory.systemTemp.createTemp(
+        'playback-settings-',
+      );
+      addTearDown(() => settingsDirectory.delete(recursive: true));
+      final settingsStore = CacheSettingsStore(directory: settingsDirectory);
+      await settingsStore.save(
+        const CacheSettings(
+          playback: PlaybackBufferSettings(
+            forwardMiB: 32,
+            readAheadSeconds: 15,
+            resumeSeconds: 1,
+          ),
+        ),
+      );
       final backend = await NativeBackend.start();
       final root = fixtureSetting('VHDX_SAMPLE_DIR')!;
       await tester.pumpWidget(
         ReaderApp(
           backend: backend,
+          cacheSettings: await settingsStore.load(),
           initialImage: fixture,
           pickImages: () async => [
             '$root${Platform.pathSeparator}basicvhdx.vhdx',
@@ -59,22 +76,34 @@ void main() {
       expect(source.error, isNull);
       final native = source.player.platform as NativePlayer;
       expect(await native.getProperty('cache-on-disk'), 'no');
+      expect(
+        int.parse(await native.getProperty('demuxer-max-bytes')),
+        32 * 1024 * 1024,
+      );
+      expect(double.parse(await native.getProperty('cache-secs')), 15);
+      expect(double.parse(await native.getProperty('cache-pause-wait')), 1);
+      expect(await native.getProperty('cache-pause-initial'), 'yes');
       if (Platform.isIOS) {
         expect(source.audioOutputAvailable, isFalse);
         expect(await native.getProperty('current-ao'), 'null');
       }
       expect(source.player.state.width, 640);
       final stats = await source.statistics();
-      expect(stats['bytes'] as int, lessThan(8 * 1024 * 1024));
+      expect(stats['transport'], 'native');
+      expect(stats['bytes'] as int, greaterThan(0));
+      // The larger packet cache can hold this entire small fixture. A seek
+      // may therefore be served without a new underlying byte-range request.
+      await source.seek(const Duration(seconds: 16));
+      await waitFor(
+        tester,
+        () => source.position.inMilliseconds > 17000 && !source.buffering,
+      );
+      expect(source.error, isNull);
       await tester.tap(find.byKey(const Key('media-play')));
       await waitFor(tester, () => !source.playing);
       final seek = tester.getRect(find.byKey(const Key('media-seek')));
       await tester.tapAt(Offset(seek.left + seek.width * 0.84, seek.center.dy));
       await waitFor(tester, () => source.position.inSeconds >= 25);
-      expect(
-        (await source.statistics())['ranges'] as int,
-        greaterThan(stats['ranges'] as int),
-      );
       final screenshotPath = fixtureSetting('VHDX_MEDIA_SCREENSHOT');
       if (screenshotPath != null) {
         final png = await source.player.screenshot(format: 'image/png');
