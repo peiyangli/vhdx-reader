@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vhdx_reader/backend.dart';
 import 'package:vhdx_reader/main.dart';
 import 'package:vhdx_reader/recent_images.dart';
+import 'package:vhdx_reader/platform_storage.dart';
 import 'reader_test.dart' show FakeBackend;
 
 class FailedImageBackend extends FakeBackend {
@@ -16,6 +17,27 @@ class FailedImageBackend extends FakeBackend {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  setUp(() {
+    // These UI tests use synthetic paths and FakeBackend. Apple hosts restore
+    // security-scoped bookmarks through a native channel even when the widget
+    // is rendering another target platform's layout.
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(PlatformStorage.channel, (call) async {
+          final arguments = call.arguments as Map<dynamic, dynamic>;
+          if (call.method == 'restoreRecent') {
+            final uri = arguments['uri'] as String;
+            return {'uri': uri, 'name': uri.split('/').last};
+          }
+          if (call.method == 'bookmarkRecent') return 'test-bookmark';
+          throw MissingPluginException();
+        });
+  });
+  tearDown(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(PlatformStorage.channel, null);
+  });
+
   test(
     'recent locations persist, deduplicate and serialize writes; clear removes bookmarks',
     () async {

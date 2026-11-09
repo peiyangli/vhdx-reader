@@ -129,5 +129,7 @@ void main() {
       );
       await backend.request({'op': 'close'});
     },
+    // Saved unlock now requires a real system prompt and an attending user.
+    skip: !const bool.fromEnvironment('VHDX_INTERACTIVE_AUTH_TESTS'),
   );
 }

@@ -63,15 +63,16 @@ Future<int> rotation() async =>
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
-  testWidgets(
-    'Android shake detector rejects noise and confirms stable target',
-    (tester) async {
-      final checks = await PlatformStorage.channel.invokeListMethod<String>(
-        'debugShakeChecks',
-      );
-      expect(checks, hasLength(6));
-    },
-  );
+  testWidgets('Android shake detector rejects noise and confirms stable target', (
+    tester,
+  ) async {
+    // Render a frame so the integration binding can finish this channel-only test.
+    await tester.pumpWidget(const MaterialApp(home: SizedBox.shrink()));
+    final checks = await PlatformStorage.channel.invokeListMethod<String>(
+      'debugShakeChecks',
+    );
+    expect(checks, hasLength(6));
+  });
   testWidgets(
     'Android Keystore remembers a password file, reopens without it and forgets',
     (tester) async {
@@ -141,6 +142,8 @@ void main() {
         ),
       );
     },
+    // Run with an attending user to approve the system authentication prompt.
+    skip: !const bool.fromEnvironment('VHDX_INTERACTIVE_AUTH_TESTS'),
   );
   testWidgets(
     'Android SAF descriptors: independent images, BitLocker, pipe rejection, PDF and video',
