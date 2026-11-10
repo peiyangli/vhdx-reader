@@ -6,6 +6,8 @@ import 'package:flutter/services.dart';
 import 'pdf_preview.dart';
 import 'media_preview.dart';
 import 'screen_layout.dart';
+import 'file_types.dart';
+export 'file_types.dart' show extension, isText, isImage, isVideo;
 
 String formatBytes(int bytes) {
   if (bytes < 1024) return '$bytes B';
@@ -16,51 +18,6 @@ String formatBytes(int bytes) {
   return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
 }
 
-String extension(String name) =>
-    name.contains('.') ? name.split('.').last.toLowerCase() : '';
-bool isText(String name) => [
-  'txt',
-  'md',
-  'log',
-  'json',
-  'xml',
-  'csv',
-  'yaml',
-  'yml',
-  'ini',
-  'toml',
-  'rs',
-  'dart',
-  'py',
-  'c',
-  'h',
-  'cpp',
-  'js',
-  'ts',
-  'html',
-  'css',
-  'srt',
-  'vtt',
-].contains(extension(name));
-bool isImage(String name) =>
-    ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].contains(extension(name));
-bool isVideo(String name) => [
-  'mp4',
-  'mkv',
-  'mov',
-  'avi',
-  'asf',
-  'rm',
-  'rmvb',
-  'webm',
-  'm4v',
-  'wmv',
-  'flv',
-  'ts',
-  'mts',
-  'm2ts',
-  '3gp',
-].contains(extension(name));
 IconData fileIcon(String name, bool directory) {
   if (directory) return Icons.folder_rounded;
   if (isImage(name)) return Icons.image_outlined;
@@ -90,6 +47,7 @@ class PreviewData {
   final PdfPreviewSource? pdf;
   final MediaPreviewSource? media;
   void dispose() {
+    bytes?.fillRange(0, bytes!.length, 0);
     pdf?.dispose();
     media?.dispose();
   }

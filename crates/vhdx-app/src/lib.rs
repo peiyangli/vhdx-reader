@@ -1,6 +1,14 @@
 //! Desktop ABI. Requests run on a dedicated Rust worker that owns all native handles.
 //! Dart calls the blocking ABI from a helper isolate; the Flutter UI never waits in FFI.
+mod cache_maintenance;
+#[cfg(test)]
+mod cache_maintenance_tests;
+mod export;
+#[cfg(test)]
+mod export_tests;
 mod media;
+mod preview;
+pub use preview::vhdx_file_read;
 mod native_media;
 mod thumbnail;
 pub use native_media::{vhdx_mpv_open, MpvStreamInfo};
@@ -12,7 +20,6 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     ffi::{c_char, CString},
-    io::Write,
     path::{Path, PathBuf},
     ptr,
     rc::Rc,
@@ -276,6 +283,7 @@ impl MediaSource {
     }
 }
 struct State {
+    export_revoked: Cancellation,
     disk_cache: Rc<RefCell<DiskCache>>,
     source_identity: String,
     context: u64,
@@ -295,6 +303,7 @@ impl State {
     }
     fn with_disk_cache(disk_cache: Rc<RefCell<DiskCache>>) -> Self {
         Self {
+            export_revoked: Cancellation::default(),
             disk_cache,
             source_identity: String::new(),
             context: 0,
@@ -310,6 +319,8 @@ impl State {
     }
     fn clear(&mut self) {
         thumbnail::revoke(self.context);
+        self.export_revoked.cancel();
+        self.export_revoked = Cancellation::default();
         self.media.clear();
         self.files.clear();
         self.volume = None;
@@ -342,45 +353,10 @@ impl State {
             return Err(Error::Invalid("stale_session".into()));
         }
         match request {
-            Request::DiskCacheConfigure {
-                cache_enabled,
-                directory,
-                enabled,
-                max_gib,
-                retention_days,
-            } => {
-                if ![1, 2, 4, 8, 16, 32, 64, 128].contains(max_gib)
-                    || ![0, 1, 7, 30].contains(retention_days)
-                {
-                    return Err(Error::Invalid("disk_cache_settings".into()));
-                }
-                self.disk_cache
-                    .borrow_mut()
-                    .configure(
-                        Path::new(directory),
-                        *enabled,
-                        max_gib * 1024 * 1024 * 1024,
-                        *retention_days,
-                    )
-                    .map_err(|_| Error::Invalid("disk_cache_unavailable".into()))?;
-                self.disk_cache.borrow().control.set_enabled(*cache_enabled);
-                Ok(serde_json::to_value(self.disk_cache.borrow().status()).unwrap())
-            }
-            Request::DiskCacheClear => {
-                let removed = self
-                    .disk_cache
-                    .borrow_mut()
-                    .clear()
-                    .map_err(|_| Error::Invalid("disk_cache_clear_failed".into()))?;
-                Ok(
-                    json!({"removed_bytes":removed,"remaining_bytes":self.disk_cache.borrow().status().bytes}),
-                )
-            }
+            Request::DiskCacheConfigure { .. } | Request::DiskCacheClear => Err(Error::Invalid(
+                "disk cache administration requires worker scheduling".into(),
+            )),
             Request::DiskCacheStatus => {
-                self.disk_cache
-                    .borrow_mut()
-                    .maintain()
-                    .map_err(|_| Error::Invalid("disk_cache_cleanup_failed".into()))?;
                 Ok(serde_json::to_value(self.disk_cache.borrow().status()).unwrap())
             }
             Request::ThumbnailBegin { .. }
@@ -435,6 +411,8 @@ impl State {
                 let credential = saved.credential()?;
                 cancel.check()?;
                 thumbnail::revoke(self.context);
+                self.export_revoked.cancel();
+                self.export_revoked = Cancellation::default();
                 self.media.clear();
                 self.files.clear();
                 self.volume = None;
@@ -541,6 +519,8 @@ impl State {
                     return Err(Error::Invalid("credential mode".into()));
                 }
                 thumbnail::revoke(self.context);
+                self.export_revoked.cancel();
+                self.export_revoked = Cancellation::default();
                 self.media.clear();
                 self.files.clear();
                 // Drop previous plaintext context before any attempt to switch/reunlock a volume.
@@ -746,46 +726,13 @@ impl State {
                 Self::read_file(&file, *offset, *length, cancel)
             }
 
-            Request::Export {
-                path,
-                output,
-                output_fd,
-                ..
-            } => {
-                let file = self.volume.as_ref().ok_or(Error::Locked)?.open_file(path)?;
-                let mut destination = if let Some(fd) = output_fd {
-                    duplicate_file_descriptor(*fd)?
-                } else {
-                    std::fs::OpenOptions::new()
-                        .create_new(true)
-                        .write(true)
-                        .open(output)?
-                };
-                let result = (|| {
-                    let mut bytes = Zeroizing::new(vec![0; 1024 * 1024]);
-                    let mut position = 0;
-                    while position < file.len() {
-                        let n = file.read_at(position, &mut bytes, cancel)?;
-                        if n == 0 {
-                            return Err(Error::Invalid("unexpected file EOF".into()));
-                        }
-                        destination.write_all(&bytes[..n])?;
-                        position += n as u64;
-                    }
-                    cancel.check()?;
-                    destination.sync_all()?;
-                    Ok(json!({"size":position}))
-                })();
-                if result.is_err() {
-                    drop(destination);
-                    if output_fd.is_none() {
-                        let _ = std::fs::remove_file(output);
-                    }
-                }
-                result
+            Request::Export { .. } => {
+                Err(Error::Invalid("export requires worker scheduling".into()))
             }
             Request::Lock { .. } => {
                 thumbnail::revoke(self.context);
+                self.export_revoked.cancel();
+                self.export_revoked = Cancellation::default();
                 self.media.clear();
                 self.files.clear();
                 self.volume = None;
@@ -817,7 +764,11 @@ impl State {
         Ok(json!({"bytes":STANDARD.encode(&bytes[..done]),"size":file.len(),"offset":offset}))
     }
     fn handle(&mut self, request: &Request, cancel: &Cancellation) -> Value {
-        match self.apply(request, cancel) {
+        let result = self.apply(request, cancel);
+        self.response(request, result)
+    }
+    fn response(&mut self, request: &Request, result: Result<Value>) -> Value {
+        match result {
             Ok(data) => json!({"ok":true,"session":self.generation,"data":data}),
             Err(error) => {
                 let invalidated = matches!(error, Error::Native(_) | Error::Io(_))
@@ -874,6 +825,7 @@ impl State {
                         }
                         .to_owned(),
                     ),
+                    Error::Invalid(code) if code == "export_busy" => ("busy", "导出任务已满，请稍后重试。".to_owned()),
                     Error::Invalid(_) => (
                         "invalid",
                         "文件格式或输入无效，请检查镜像和解锁信息。".to_owned(),
@@ -884,7 +836,13 @@ impl State {
         }
     }
 }
+impl Drop for State {
+    fn drop(&mut self) {
+        self.export_revoked.cancel();
+    }
+}
 struct Job {
+    cancel: Cancellation,
     context: u64,
     request: Request,
     reply: mpsc::SyncSender<Value>,
@@ -901,39 +859,250 @@ struct MediaRead {
     task: Option<Arc<thumbnail::Task>>,
 }
 enum WorkItem {
+    ExportReady,
     Command(Job),
     Read(MediaRead),
+    Preview(preview::Job),
     Retire {
         before: u64,
         reply: mpsc::SyncSender<()>,
     },
 }
+#[derive(Default)]
+struct ActiveWork {
+    current: Option<(u64, Cancellation)>,
+    exports: HashMap<u64, Cancellation>,
+    previews: HashMap<u64, (u64, Cancellation)>,
+    cache_maintenance: Option<(u64, Cancellation)>,
+}
+impl ActiveWork {
+    fn cancel(&self, context: u64) {
+        if let Some((owner, token)) = &self.current {
+            if *owner == context {
+                token.cancel();
+            }
+        }
+        if let Some((owner, token)) = &self.cache_maintenance {
+            if *owner == context {
+                token.cancel();
+            }
+        }
+        for (owner, token) in self.previews.values() {
+            if *owner == context {
+                token.cancel();
+            }
+        }
+        if let Some(token) = self.exports.get(&context) {
+            token.cancel();
+        }
+    }
+}
+struct ExportJob {
+    job: Job,
+    transfer: export::Transfer,
+}
+type Exports = std::collections::VecDeque<ExportJob>;
+
+/// One source chunk per turn, round-robin across exports. Poll all bounded
+/// writers before sleeping so one slow target cannot hold up another export.
+fn advance_exports(
+    exports: &mut Exports,
+    states: &mut HashMap<u64, State>,
+    active: &Mutex<ActiveWork>,
+) -> bool {
+    for _ in 0..exports.len() {
+        let mut pending = exports.pop_front().unwrap();
+        let context = pending.job.context;
+        if let Ok(mut active) = active.lock() {
+            active.current = Some((context, pending.transfer.cancel.clone()));
+        }
+        let step = pending.transfer.step();
+        if let Ok(mut active) = active.lock() {
+            active.current = None;
+        }
+        match step {
+            export::Step::Finished(result) => {
+                if let Ok(mut active) = active.lock() {
+                    active.exports.remove(&context);
+                }
+                let response = if let Some(state) = states.get_mut(&context) {
+                    state.response(&pending.job.request, result)
+                } else {
+                    failure("closed", "读取会话已关闭。")
+                };
+                let _ = pending.job.reply.send(response);
+                return true;
+            }
+            export::Step::Progress => {
+                exports.push_back(pending);
+                return true;
+            }
+            export::Step::Waiting => exports.push_back(pending),
+        }
+    }
+    false
+}
+fn revoke_exports(exports: &mut Exports) {
+    for pending in exports {
+        pending.transfer.revoke_if_needed();
+    }
+}
+struct Retirement {
+    before: u64,
+    reply: mpsc::SyncSender<()>,
+}
+fn finish_retirements(retirements: &mut Vec<Retirement>, exports: &Exports) {
+    retirements.retain(|retirement| {
+        if exports
+            .iter()
+            .any(|export| export.job.context < retirement.before)
+        {
+            true
+        } else {
+            let _ = retirement.reply.send(());
+            false
+        }
+    });
+}
 struct Worker {
-    sender: mpsc::SyncSender<WorkItem>,
-    active: Arc<Mutex<Option<(u64, Cancellation)>>>,
+    sender: Arc<mpsc::SyncSender<WorkItem>>,
+    active: Arc<Mutex<ActiveWork>>,
 }
 impl Worker {
+    fn enqueue(
+        &self,
+        context: u64,
+        request: Request,
+        reply: mpsc::SyncSender<Value>,
+    ) -> std::result::Result<(), Value> {
+        let cancel = Cancellation::default();
+        let cache_admin = cache_maintenance::is_admin(&request);
+        if cache_admin {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| failure("internal", "读取线程已结束。"))?;
+            if active.cache_maintenance.is_some() {
+                return Err(failure("busy", "磁盘缓存正在维护，请稍后重试。"));
+            }
+            active.cache_maintenance = Some((context, cancel.clone()));
+        }
+        let exporting = matches!(request, Request::Export { .. });
+        if exporting {
+            let mut active = self
+                .active
+                .lock()
+                .map_err(|_| failure("internal", "读取线程已结束。"))?;
+            // Reserve before enqueue: cancellation must cover a queued export,
+            // and queued + running exports share the same bounded admission.
+            if active.exports.len() >= export::MAX_EXPORTS || active.exports.contains_key(&context)
+            {
+                return Err(failure("busy", "导出任务已满，请稍后重试。"));
+            }
+            active.exports.insert(context, cancel.clone());
+        }
+        match self.sender.try_send(WorkItem::Command(Job {
+            context,
+            request,
+            reply,
+            cancel,
+        })) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if cache_admin {
+                    if let Ok(mut active) = self.active.lock() {
+                        active.cache_maintenance = None;
+                    }
+                }
+                if exporting {
+                    if let Ok(mut active) = self.active.lock() {
+                        active.exports.remove(&context);
+                    }
+                }
+                Err(match error {
+                    mpsc::TrySendError::Full(_) => failure("busy", "读取队列已满，请稍后重试。"),
+                    mpsc::TrySendError::Disconnected(_) => failure("internal", "读取线程已结束。"),
+                })
+            }
+        }
+    }
     fn start() -> std::result::Result<Self, String> {
         let (sender, receiver) = mpsc::sync_channel::<WorkItem>(8);
-        let active = Arc::new(Mutex::new(None));
+        let active = Arc::new(Mutex::new(ActiveWork::default()));
         let shared = active.clone();
+        let sender = Arc::new(sender);
+        // The worker must not retain its own sender when idle. Each active
+        // writer gets a clone only for its lifetime.
+        let worker_wake = Arc::downgrade(&sender);
         thread::Builder::new().name("vhdx-reader".into()).spawn(move || {
             let mut states = HashMap::<u64, State>::new();
             let disk_cache = Rc::new(RefCell::new(DiskCache::default()));
+            disk_cache.borrow_mut().set_write_buffering(true);
             let mut retired_before = 0;
-            while let Ok(item) = receiver.recv() {
+            let mut exports = Exports::new();
+            let mut maintenance = None;
+            let mut retirements = Vec::new();
+            let mut foreground = 0;
+            loop {
+                // Foreground work goes first, but sustained playback/browsing
+                // yields an export turn after at most four dispatched items.
+                if foreground >= 4 {
+                    cache_maintenance::advance(&mut maintenance, &disk_cache, &mut states, &shared);
+                    disk_cache.borrow_mut().advance_write_buffer();
+                    advance_exports(&mut exports, &mut states, &shared);
+                    finish_retirements(&mut retirements, &exports);
+                    foreground = 0;
+                }
+                let item = match receiver.try_recv() {
+                    Ok(item) => item,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        let cache_progress = cache_maintenance::advance(&mut maintenance, &disk_cache, &mut states, &shared);
+                        let write_progress = disk_cache.borrow_mut().advance_write_buffer();
+                        if advance_exports(&mut exports, &mut states, &shared) || cache_progress || write_progress {
+                            finish_retirements(&mut retirements, &exports);
+                            foreground = 0;
+                            continue;
+                        }
+                        finish_retirements(&mut retirements, &exports);
+                        match receiver.recv_timeout(std::time::Duration::from_secs(60)) {
+                            Ok(item) => item,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                };
                 let job = match item {
+                    WorkItem::ExportReady => continue,
                     WorkItem::Retire { before, reply } => {
                         retired_before = retired_before.max(before);
+                        cache_maintenance::close(&mut maintenance, &disk_cache, &shared, |id| id < retired_before);
                         thumbnail::retire(retired_before);
                         states.retain(|id, _| *id >= retired_before);
-                        let _ = reply.send(());
+                        revoke_exports(&mut exports);
+                        // Retirement must not release platform leases while a
+                        // target descriptor still writes or syncs. Bound waiters.
+                        if retirements.len() < 8 {
+                            retirements.push(Retirement { before, reply });
+                        }
+                        finish_retirements(&mut retirements, &exports);
+                        foreground += 1;
                         continue;
                     }
-                    WorkItem::Command(job) => job,
+                    WorkItem::Command(job) => {
+                        foreground += 1;
+                        job
+                    }
+                    WorkItem::Preview(job) => {
+                        foreground += 1;
+                        preview::run(job, &mut states, &shared, retired_before);
+                        revoke_exports(&mut exports);
+                        continue;
+                    }
                     WorkItem::Read(job) => {
+                        foreground += 1;
                         let started = std::time::Instant::now();
-                        if let Ok(mut active) = shared.lock() { *active = Some((job.context, job.cancel.clone())); }
+                        if let Ok(mut active) = shared.lock() { active.current = Some((job.context, job.cancel.clone())); }
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Zeroizing<Vec<u8>>> {
                             let state = states.get(&job.context).ok_or(Error::Locked)?;
                             if state.generation != job.session || !state.media.contains_key(&job.file) { return Err(Error::Locked); }
@@ -955,7 +1124,7 @@ impl Worker {
                             bytes.truncate(done);
                             Ok(bytes)
                         })).unwrap_or_else(|_| Err(Error::Invalid("media reader panicked".into())));
-                        if let Ok(mut active) = shared.lock() { *active = None; }
+                        if let Ok(mut active) = shared.lock() { active.current = None; }
                         if let Some(task) = &job.task { task.record(false, job.offset, job.length, result.as_ref().map(|b|b.len()).unwrap_or(0), started.elapsed()); }
                         if let Some(stream) = states.get_mut(&job.context).and_then(|s| s.media.get_mut(&job.file)) {
                             stream.read_calls += 1;
@@ -964,27 +1133,66 @@ impl Worker {
                         }
                         if matches!(&result, Err(Error::Io(_) | Error::Native(_))) {
                             if let Some(state) = states.get_mut(&job.context) { state.clear(); }
+                            revoke_exports(&mut exports);
                         }
                         let _ = job.reply.send(result);
                         continue;
                     }
                 };
                 if job.context < retired_before {
+                    if cache_maintenance::is_admin(&job.request) {
+                        if let Ok(mut active) = shared.lock() { active.cache_maintenance = None; }
+                    }
+                    if matches!(job.request, Request::Export { .. }) {
+                        if let Ok(mut active) = shared.lock() { active.exports.remove(&job.context); }
+                    }
                     let _ = job.reply.send(failure("closed", "读取会话已关闭。"));
                     continue;
                 }
                 if matches!(job.request, Request::Dispose) {
+                    cache_maintenance::close(&mut maintenance, &disk_cache, &shared, |id| id == job.context);
                     thumbnail::revoke(job.context);
                     states.remove(&job.context);
+                    revoke_exports(&mut exports);
                     let _ = job.reply.send(json!({"ok":true,"data":{}}));
                     continue;
                 }
-                let token = Cancellation::default();
+                let token = job.cancel.clone();
                 if let Ok(mut active) = shared.lock() {
-                    *active = Some((job.context, token.clone()));
+                    active.current = Some((job.context, token.clone()));
                 }
                 let state = states.entry(job.context).or_insert_with(|| State::with_disk_cache(disk_cache.clone()));
                 state.context = job.context;
+                if cache_maintenance::is_admin(&job.request) {
+                    cache_maintenance::start(job, state, &disk_cache, &mut maintenance, &shared);
+                    continue;
+                }
+                if matches!(job.request, Request::Export { .. }) {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if exports.len() >= export::MAX_EXPORTS || exports.iter().any(|e| e.job.context == job.context) {
+                            return Err(Error::Invalid("export_busy".into()));
+                        }
+                        let wake = worker_wake.upgrade().ok_or(Error::Cancelled)?;
+                        export::Transfer::start(state, &job.request, token.clone(), (*wake).clone())
+                    })).unwrap_or_else(|_| Err(Error::Invalid("export_start_panicked".into())));
+                    match result {
+                        Ok(transfer) => {
+                            if let Ok(mut active) = shared.lock() {
+                                active.exports.insert(job.context, token);
+                                active.current = None;
+                            }
+                            exports.push_back(ExportJob { job, transfer });
+                        }
+                        Err(error) => {
+                            if let Ok(mut active) = shared.lock() {
+                                active.current = None;
+                                active.exports.remove(&job.context);
+                            }
+                            let _ = job.reply.send(state.response(&job.request, Err(error)));
+                        }
+                    }
+                    continue;
+                }
                 let response = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.handle(&job.request, &token))) {
                     Ok(response) => response,
                     Err(_) => {
@@ -992,7 +1200,8 @@ impl Worker {
                         json!({"ok":false,"session":state.generation,"invalidated":true,"error":{"code":"internal","message":"读取会话意外结束，请重新打开镜像。"}})
                     }
                 };
-                if let Ok(mut active) = shared.lock() { *active = None; }
+                if let Ok(mut active) = shared.lock() { active.current = None; }
+                revoke_exports(&mut exports);
                 let _ = job.reply.send(response);
             }
         }).map_err(|e| e.to_string())?;
@@ -1048,7 +1257,7 @@ pub extern "C" fn vhdx_context_create() -> u64 {
 }
 #[no_mangle]
 pub extern "C" fn vhdx_api_version() -> u32 {
-    9
+    10
 }
 fn failure(code: &str, message: &str) -> Value {
     json!({"ok":false,"error":{"code":code,"message":message}})
@@ -1089,15 +1298,8 @@ pub fn request_context(context: u64, input: &[u8]) -> Value {
         Err(_) => return failure("internal", "无法启动读取线程。"),
     };
     let (reply, response) = mpsc::sync_channel(1);
-    if let Err(error) = worker.sender.try_send(WorkItem::Command(Job {
-        context,
-        request,
-        reply,
-    })) {
-        return match error {
-            mpsc::TrySendError::Full(_) => failure("busy", "读取队列已满，请稍后重试。"),
-            mpsc::TrySendError::Disconnected(_) => failure("internal", "读取线程已结束。"),
-        };
+    if let Err(error) = worker.enqueue(context, request, reply) {
+        return error;
     }
     response
         .recv()
@@ -1234,7 +1436,8 @@ pub unsafe extern "C" fn vhdx_request(
     result.unwrap_or(ptr::null_mut())
 }
 /// # Safety
-/// `response` is null or a live pointer returned by vhdx_request, never freed before.
+/// `response` is null or a live metadata pointer returned by vhdx_request or
+/// vhdx_file_read, never freed before.
 #[no_mangle]
 pub unsafe extern "C" fn vhdx_response_free(response: *mut c_char) {
     if !response.is_null() {
@@ -1246,11 +1449,7 @@ pub unsafe extern "C" fn vhdx_response_free(response: *mut c_char) {
 pub extern "C" fn vhdx_cancel(context: u64) {
     if let Some(Ok(worker)) = WORKER.get() {
         if let Ok(active) = worker.active.lock() {
-            if let Some((owner, token)) = active.as_ref() {
-                if *owner == context {
-                    token.cancel();
-                }
-            }
+            active.cancel(context);
         }
     }
 }
@@ -1312,6 +1511,7 @@ mod tests {
                     context,
                     request: Request::Dispose,
                     reply,
+                    cancel: Cancellation::default(),
                 }))
                 .unwrap();
             let response = receive

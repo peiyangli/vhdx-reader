@@ -67,7 +67,7 @@ Windows x64, Android ARM64 and macOS ARM64 Flutter browser, plus Windows/Linux C
 
 The data path is `LocalFile -> libvhdi -> partition Slice -> optional libbde -> CachedReader -> libfsntfs -> File`. Each native layer consumes a `libbfio` callback handle. File access does not require a mounted disk, administrator rights, whole-image conversion, or plaintext intermediate volumes.
 
-The Flutter shell now uses a small versioned C ABI (version 9) (`crates/vhdx-app/include/vhdx_app.h`) through `dart:ffi`. This is a deliberate first integration instead of introducing flutter_rust_bridge code generation. An auxiliary Dart isolate makes blocking ABI calls; a dedicated Rust worker owns a map of independent native contexts. Every image tab has its own context ID, native image, unlocked volume, cache and generation. The UI retains tab widgets and their browsing/preview state; closing one disposes only that context. Reopening the same normalized path focuses the existing tab. The shared eight-slot queue rejects overflow; native execution remains serialized. Cancellation targets the active operation only if its context ID matches. Lock/close increment that context’s session generation and stale requests are rejected. Typed secrets and imported credential files use the same credential parser as the CLI; only paths, not password values, are passed as process arguments.
+The Flutter shell now uses a small versioned C ABI (version 9) (`crates/vhdx-app/include/vhdx_app.h`) through `dart:ffi`. This is a deliberate first integration instead of introducing flutter_rust_bridge code generation. An auxiliary Dart isolate makes blocking ABI calls; a dedicated Rust worker owns a map of independent native contexts. Every image tab has its own context ID, native image, unlocked volume, cache and generation. The UI retains tab widgets and their browsing/preview state; closing one disposes only that context. Reopening the same normalized path focuses the existing tab. The shared eight-slot queue rejects overflow; native execution remains serialized. Cancellation targets the matching active operation and the context’s queued or running export. Exports yield after each 256 KiB native read; foreground requests have priority with an export turn after at most four foreground items. Up to four exports (one per context) hand one reusable buffer each to target writer threads for write/sync/close. Native image and filesystem handles remain on the reader thread. Lock/reunlock/dispose revoke exports, and engine retirement acknowledges only after affected targets have closed. See the PERF-01 section in [read-performance.md](read-performance.md). Lock/close increment that context’s session generation and stale requests are rejected. Typed secrets and imported credential files use the same credential parser as the CLI; only paths, not password values, are passed as process arguments.
 
 The UI implements image/partition selection, password and recovery unlock, paginated directory browsing, hiding system entries, loaded-entry filtering, bounded text/image previews, random-access PDF viewing, export and cancellation. Plaintext preview bytes use Base64 over this small JSON ABI. PDF adds file_open/file_read/file_close tokens, a serialized 64 KiB page reader and a 1 MiB Dart LRU cache. PdfDocumentRefCustom disables whole-file caching and reads through the same bounded ABI; no whole PDF is staged on disk; the optional shared file disk cache can persist accessed plaintext pages. Viewer state is retained across image tabs and hidden viewers pause rendering. The 32 MiB render cache target is separate from the Rust/Dart byte caches and is not a process memory limit. This path is for bounded preview requests; video streaming uses the separate binary adapter described below.
 
@@ -105,7 +105,7 @@ The builder defaults to the native host CPU with an explicit NativeBuild.xcconfi
 ## Remaining milestones
 
 1. Independent Windows native filesystem comparison (requires an elevated, read-only attachment), additional 4Kn/fixed/compressed/sparse/Unicode/deep-directory fixtures, fuzzing and measured benchmarks.
-2. Extend the implemented bounded FIFO worker with preview priorities, progress events, source-removal detection and reconnection. Cancellation is cooperative between native calls/chunks.
+2. Extend the bounded worker with priorities among foreground previews, progress events, source-removal detection and reconnection; cooperative export scheduling is implemented. Cancellation is cooperative between native calls/chunks.
 3. Extend the implemented PDF viewer with search, outlines and independent PDF passwords; test complex fonts/scanned documents. Add GBK/GB18030 text decoding and image improvements. The C ABI remains separate from domain logic.
 4. Broaden video validation beyond the generated 32-second H.264/AAC fixture: HEVC/4K/HDR, real external SSD throughput and unplug behavior, encrypted video fixtures, audio-only UI, subtitles and track selection. Update/audit the old upstream native playback binaries before a public release.
 5. Android external SSD provider compatibility, unplug/reconnect behavior, lifecycle stress tests and broader device/API coverage. The ARM64 build and SAF descriptor bridge are implemented.
@@ -134,7 +134,7 @@ No speed or broad media-format compatibility claim is established by the tiny ex
 
 ## Configurable volume cache layout (ABI 8)
 
-Unlock JSON `cache` now accepts `plaintext_page_kib` (64, 128, 256, 512, 1024, 2048, 4096; default 64). `plaintext_mib` accepts powers of two from 16 through 16384. The native worker validates the whitelist and checked MiB-to-byte conversion before touching the existing volume; unsupported 32-bit budgets are rejected instead of wrapping. Defaults for omitted fields remain backward compatible. This layout required ABI 8; the current frontend expects ABI 9 for the disk-cache controls below.
+Unlock JSON `cache` now accepts `plaintext_page_kib` (64, 128, 256, 512, 1024, 2048, 4096; default 64). `plaintext_mib` accepts powers of two from 16 through 16384. The native worker validates the whitelist and checked MiB-to-byte conversion before touching the existing volume; unsupported 32-bit budgets are rejected instead of wrapping. Defaults for omitted fields remain backward compatible. This layout required ABI 8; disk-cache controls below introduced ABI 9; the current frontend expects ABI 10 for binary preview reads.
 
 The core keeps `unlock` and `unlock_with_caches` with their existing 64 KiB defaults, and adds `unlock_with_cache_layout` for explicit plaintext page sizing. Each unlocked volume owns a lazy LRU page cache under NTFS; page keys are offsets in that volume, shared across file and metadata reads. Ciphertext coalescing remains independently budgeted with 64 KiB pages. The frontend persists layout changes for the next unlock/open and displays maximum page count. Neither capacity selection nor opening a volume preallocates the full budget.
 
@@ -148,3 +148,42 @@ The read path is memory plaintext pages → disk plaintext pages → decrypted/s
 The master control is shared by plaintext memory caches, ciphertext memory caches and disk readers, including existing volumes. Disabled memory readers drop their retained pages on their next read and bypass the cache; disk reads and writes are bypassed immediately. Player/decoder buffering and thumbnail caches remain separate. Toggling disk use or master use does not delete persistent blocks. Manual clear removes only managed files and reports deletion failures. Existing memory/player data is not cleared by the disk-only clear command.
 
 Disk LRU index loads once per configured directory, uses an ordered access index for eviction, and persists last use in file timestamps. Expiry is checked at initialization/configuration/status, on expired hits, and at most once per minute during writes; no background daemon or scheduling is installed. Capacity shrink trims immediately. Permanent retention still obeys quota and manual clear; OS cache-folder eviction remains possible. UI saves preference changes atomically and rolls native configuration back if saving fails. Existing volumes retain their page size until re-unlock.
+
+
+## PERF-02 大目录渐进加载（2026-11-09，源码变更）
+
+目录首批立即展示，后续按约 32 ms 合并更新；自然名称及元数据排序键按当前目录缓存，新增批次排序后合并，列表/网格和视频邻居共享不可变快照。增量插入保持可见条目的纵向位置，主动换排序回到顶部。分页捕获固定过滤条件，过滤变更取消旧轮并重读；打开部分目录中的条目先取消并等待当前请求结束，已接收的有效数据保留，迟到响应丢弃。
+
+Windows profile 模拟分页对照中，1 万项首屏 873.847 → 20.948 ms、5 万项首屏 4529.783 → 18.342 ms。缓存带来额外内存，主动切换五万项目录排序仍有同步开销；性能场景、测试、原始结果及边界见 [PERF-02 性能记录](read-performance.md#perf-02-大目录渐进展示与排序缓存2026-11-09)。本轮不更新发布包。
+
+
+## PERF-03 磁盘缓存规模与维护（2026-11-10，源码变更）
+
+磁盘缓存加入 65,536 个块的独立上限，和现有字节配额共同生效。扫描边读取边控制索引规模，不先收集所有文件。扫描、过期、缩容及清空由原生读取线程按最多 64 条记录/约 2 ms 的批次推进，与前台请求和 PERF-01 导出调度共存；单次系统调用仍不可抢占。维护期间绕过磁盘缓存，显式维护全局最多一个，支持排队/批次间取消、上下文释放与引擎退休。状态返回新增 limit_entries 和 maintenance_pending，状态查询不再同步清理全部过期项。
+
+保留 v1 布局、目录锁、块校验和临时文件恢复；换目录扫描成功后才替换旧管理器，删除失败不虚报释放空间。Linux 73 项、Windows 66 项原生回归及双端 Clippy 通过。Windows release 对照、容量代价、内存及尾延迟边界见 [PERF-03 性能记录](read-performance.md#perf-03-磁盘缓存条目上限与协作维护2026-11-10)。本轮不更新发布包。
+
+
+## PERF-04 磁盘缓存读写开销（2026-11-10，源码变更）
+
+命中时以只读句柄校验，访问时间每块最多每 60 秒尝试持久化，保留逐次内存 LRU；完整页直接填入调用方缓冲，失败清零当前页，部分页继续使用 Zeroizing 临时缓冲。应用工作线程启用最多 32 页/8 MiB 的协作写回，约每四个前台工作项及空闲时推进，每批按约 2 ms 检查预算。队列满丢弃可选缓存写入，清空/配置变更撤销待写数据，读取器关闭清理所属队列，弱引用阻止过期任务落盘。独立核心调用者默认同步写入，仅在能够持续推进队列时显式启用写回。
+
+Linux 78 项、Windows 72 项原生回归及双端 Clippy 通过。Windows NTFS/BitLocker 四状态顺序/随机对照显示热磁盘路径开销降低，冷随机路径并非全面提速；详情与复现见 [PERF-04 性能记录](read-performance.md#perf-04-磁盘缓存读取与写回开销2026-11-10)。本轮未重新打包发布。
+
+
+## PERF-05 PDF 与图片二进制读取（2026-11-10，源码变更）
+
+新增 `vhdx_file_read`（ABI 10）。每次最多 1 MiB，调用方拥有输出缓冲并负责清零/释放；Rust worker 用 Zeroizing 缓冲读取、返回后复制到调用方，JSON 只携带会话、错误和实际长度。队列和执行中的二进制请求共最多 8 个，按上下文取消；所有原生句柄继续留在原工作线程，错误沿用旧 JSON 路径的会话失效语义。原 JSON file_read/read 保留，便于兼容非原生后端和作对照。
+
+Dart 辅助 isolate 调用二进制 ABI，以 TransferableTypedData 发送数据，UI isolate 不再解析 Base64 载荷。BackendRangeReader 仅合并当前请求所需的连续缺页，到缓存命中或 1 MiB 上限停止，仍保留 64 KiB × 16 页 LRU；不跨请求投机预读。取消、会话代次变化、锁卷、关闭或读取失败均拒绝迟到结果并清零可控缓冲。图片预览与图片缩略图使用同一最多 16 MiB 的 readAll，逐批检查撤销，失败清零部分结果；关闭预览清零其编码字节。
+
+Windows 真实 NTFS/BitLocker 二进制传输、大图显示与关闭、PDF 翻页/缩放/损坏文件、视频缩略图共 6 项集成回归通过；Flutter 135 项测试及 analyze 通过。Linux 82 项、Windows 75 项原生回归与双端 Clippy 通过，包含 Linux 源故障清零专项。性能方法、复现和并非全面改善的指标见 [PERF-05 性能记录](read-performance.md#perf-05-pdf-与图片二进制读取2026-11-10)。本轮未重新打包或验证移动真机。
+
+
+## PERF-07 缩略图持久化与缓存重开（2026-11-10，源码变更）
+
+缩略图发布后立即归还生成槽位，独立 worker 完成 PNG 编码、磁盘索引、写入及淘汰；最多 64 个任务，只为执行中的一张图持有独立句柄（上限 4 MiB），排队任务复用现有内存缓存。缓存查找并发 2，独立于写入，显式清空时通过屏障等待删除完成。初始索引排序一次，后续通过有序 Map 增量维护 LRU，保留 256 MiB / 10,000 条双配额及 v1 文件兼容。
+
+请求捕获缓存代次，配置、清空、锁卷/暂停和释放撤销迟到写入；rename 返回及 PNG 解码结束后复核有效性。队满、待写图片已被内存淘汰时跳过可选落盘，不阻塞显示；失败标记也使用有界队列。查找与持久化 trace 区分命中、禁用、未命中、失败和后台排队。
+
+Flutter 165 项测试和 analyze 通过，真实 Windows 缩略图集成 3 项通过。在文件磁盘缓存与 BitLocker 缩略图缓存都开启的条件下，真实镜像重开为 5 次缩略图命中、1 次失败标记命中、零重新解码。Windows profile 三轮对照、后台落盘延迟及内存边界见 [PERF-07 性能记录](read-performance.md#perf-07-缩略图持久化与重开命中2026-11-10)。未更新发布包或测试移动真机，PERF-06 继续暂缓。

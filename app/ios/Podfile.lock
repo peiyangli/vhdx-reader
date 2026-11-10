@@ -15,7 +15,7 @@ PODS:
     - FlutterMacOS
   - url_launcher_ios (0.0.1):
     - Flutter
-  - VhdxNative (0.5.0)
+  - VhdxNative (0.6.0)
   - wakelock_plus (0.0.1):
     - Flutter
 
@@ -62,7 +62,7 @@ SPEC CHECKSUMS:
   package_info_plus: c0502532a26c7662a62a356cebe2692ec5fe4ec4
   pdfium_flutter: 17072a1d7149f500b17b0edb3e7850b9aa2a3445
   url_launcher_ios: bb13df5870e8c4234ca12609d04010a21be43dfa
-  VhdxNative: 4099a89d45a8e90d92f4398d8ca9e0ff7bc68337
+  VhdxNative: d4e63866b160100f8f6f277fd9dbb659ed7285dc
   wakelock_plus: 4d70a9769dc8dad95ca6131e70c46b2d5a5de261
 
 PODFILE CHECKSUM: b6269bf7b2ecdab1f4112f417a51eb3877c9688d

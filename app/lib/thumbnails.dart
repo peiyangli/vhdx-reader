@@ -12,55 +12,9 @@ import 'backend.dart';
 import 'cache_settings.dart';
 import 'media_preview.dart';
 import 'media_open_control.dart';
-import 'preview.dart' show isImage, isVideo, extension;
+import 'file_types.dart';
+export 'file_types.dart' show friendlyType, friendlyTypeOrder;
 import 'range_reader.dart';
-
-int friendlyTypeOrder(String name) => const [
-  '图片',
-  '视频',
-  '音频',
-  'PDF',
-  '文档',
-  '压缩包',
-  '文件',
-].indexOf(friendlyType(name));
-
-String friendlyType(String name) {
-  if (isImage(name)) return '图片';
-  if (isVideo(name)) return '视频';
-  final ext = extension(name);
-  if ([
-    'mp3',
-    'flac',
-    'wav',
-    'aac',
-    'm4a',
-    'ogg',
-    'opus',
-    'wma',
-  ].contains(ext)) {
-    return '音频';
-  }
-  if (ext == 'pdf') return 'PDF';
-  if (['zip', '7z', 'rar', 'tar', 'gz', 'xz'].contains(ext)) return '压缩包';
-  if ([
-    'txt',
-    'md',
-    'json',
-    'xml',
-    'csv',
-    'log',
-    'doc',
-    'docx',
-    'xls',
-    'xlsx',
-    'ppt',
-    'pptx',
-  ].contains(ext)) {
-    return '文档';
-  }
-  return '文件';
-}
 
 class ThumbnailScope extends ChangeNotifier {
   ThumbnailScope(
@@ -113,7 +67,8 @@ class ThumbnailRequest {
 class _UnsupportedThumbnail implements Exception {}
 
 class _Job {
-  _Job(this.scope, this.path, this.entry, this.key, this.diskKey);
+  _Job(this.scope, this.path, this.entry, this.key, this.diskKey, this.epoch);
+  final int epoch;
   final ThumbnailScope scope;
   final String path;
   final Map<String, dynamic> entry;
@@ -143,6 +98,24 @@ class _Job {
   }
 }
 
+// Waiting tickets do not own images. The normal memory cache bounds their
+// lifetime; only the active writer clones a handle across asynchronous I/O.
+class _Persistence {
+  _Persistence(this.job, {required this.failure});
+  final _Job job;
+  final bool failure;
+  Thumbnail? value;
+  final clock = Stopwatch()..start();
+  bool cancelled = false;
+}
+
+class _DiskEntry {
+  _DiskEntry(this.key, this.size, this.used);
+  final String key;
+  final int size;
+  final DateTime used;
+}
+
 /// One workspace-wide budget and scheduler, including all open images.
 class ThumbnailCache extends ChangeNotifier {
   ThumbnailCache({
@@ -153,6 +126,7 @@ class ThumbnailCache extends ChangeNotifier {
     @visibleForTesting this.generationTimeout = const Duration(seconds: 8),
     @visibleForTesting this.generator,
     @visibleForTesting this.videoTransport,
+    @visibleForTesting this.persistenceHook,
     int? memoryLimit,
     this.diskLimit = 256 * 1024 * 1024,
   }) : memoryLimit =
@@ -164,6 +138,7 @@ class ThumbnailCache extends ChangeNotifier {
   final void Function(Map<String, dynamic>)? onTrace;
   final Duration generationTimeout;
   final String? videoTransport;
+  final Future<void> Function(String)? persistenceHook;
   final Future<Thumbnail?> Function(
     ThumbnailScope,
     String,
@@ -185,6 +160,98 @@ class ThumbnailCache extends ChangeNotifier {
   int _retiring = 0;
   int _diskEpoch = 0;
   bool _disposed = false;
+  static const persistenceCountLimit = 64;
+  static const persistenceByteLimit = 4 * 1024 * 1024;
+  final _persistence = Queue<_Persistence>();
+  _Persistence? _writing;
+  int _pendingBytes = 0;
+  Completer<void>? _persistenceIdle;
+  Future<void> _readBarrier = Future.value();
+
+  @visibleForTesting
+  int get pendingPersistenceCount =>
+      _persistence.length + (_writing == null ? 0 : 1);
+  @visibleForTesting
+  int get pendingPersistenceBytes => _pendingBytes;
+  @visibleForTesting
+  Future<void> get persistenceIdle =>
+      _persistenceIdle?.future ?? Future.value();
+
+  bool _current(_Persistence item) =>
+      !_disposed &&
+      !item.cancelled &&
+      item.job.epoch == _diskEpoch &&
+      item.job.scope.available &&
+      _persistent(item.job.scope) &&
+      (!item.job.cancelled || (item.failure && item.job.timedOut));
+
+  void _enqueuePersistence(_Job job, Thumbnail? value) {
+    if (_disposed || !_persistent(job.scope) || !job.scope.available) return;
+    final bytes = value == null
+        ? 0
+        : value.image.width * value.image.height * 4;
+    if (job.epoch != _diskEpoch) return;
+    if (pendingPersistenceCount >= persistenceCountLimit ||
+        bytes > persistenceByteLimit) {
+      _trace(job, {'phase': 'persistence', 'outcome': 'queue_full'});
+      return;
+    }
+    final item = _Persistence(job, failure: value == null);
+    _persistence.add(item);
+    _persistenceIdle ??= Completer<void>();
+    if (_writing == null) unawaited(_drainPersistence());
+  }
+
+  void _cancelPersistence([ThumbnailScope? scope]) {
+    bool matches(_Persistence item) =>
+        scope == null || identical(item.job.scope, scope);
+    final active = _writing;
+    if (active != null && matches(active)) active.cancelled = true;
+    for (final item in _persistence.where(matches).toList()) {
+      _persistence.remove(item);
+    }
+  }
+
+  Future<void> _drainPersistence() async {
+    while (_persistence.isNotEmpty) {
+      final item = _writing = _persistence.removeFirst();
+      final queued = item.clock.elapsedMilliseconds;
+      var outcome = 'cancelled';
+      try {
+        if (_current(item)) {
+          item.value = item.failure ? null : _memory[item.job.key]?.clone();
+          if (!item.failure && item.value == null) {
+            outcome = 'memory_evicted';
+          } else {
+            final value = item.value;
+            _pendingBytes = value == null
+                ? 0
+                : value.image.width * value.image.height * 4;
+            outcome = await _writeDisk(item) ? 'written' : 'skipped';
+          }
+        }
+      } catch (_) {
+        outcome =
+            'failed'; // Best effort persistence must never stop the worker.
+      } finally {
+        item.value?.dispose();
+        _pendingBytes = 0;
+        _writing = null;
+        _trace(item.job, {
+          'phase': 'persistence',
+          'outcome': outcome,
+          'queue_ms': queued,
+          'elapsed_ms': item.clock.elapsedMilliseconds,
+          'pending_count': pendingPersistenceCount,
+          'pending_bytes': _pendingBytes,
+        });
+      }
+    }
+    final idle = _persistenceIdle;
+    _persistenceIdle = null;
+    idle?.complete();
+  }
+
   Future<void> _diskTail = Future.value();
   Future<T> _disk<T>(Future<T> Function() action) {
     final result = _diskTail.then((_) => action());
@@ -197,37 +264,46 @@ class ThumbnailCache extends ChangeNotifier {
   Future<Directory> _findRoot() async =>
       directory ??
       Directory('${(await getApplicationCacheDirectory()).path}/thumbnails-v1');
-  Map<String, ({int size, DateTime used})>? _diskEntries;
+  Map<String, _DiskEntry>? _diskEntries;
   int _diskBytes = 0;
   void _forgetDisk(String key) {
     final old = _diskEntries?.remove(key);
-    if (old != null) _diskBytes -= old.size;
+    if (old != null) {
+      _diskBytes -= old.size;
+    }
+  }
+
+  void _rememberDisk(String key, int size, DateTime used) {
+    _forgetDisk(key);
+    final entry = _DiskEntry(key, size, used);
+    _diskEntries![key] = entry;
+    _diskBytes += size;
   }
 
   Future<void> _indexDisk(Directory root) async {
     if (_diskEntries != null) return;
-    final entries = <String, ({int size, DateTime used})>{};
-    var bytes = 0;
+    final entries = <String, _DiskEntry>{};
     await for (final file in root.list(followLinks: false)) {
       if (file is! File) continue;
       final stat = await file.stat();
       if (stat.type != FileSystemEntityType.file) continue;
-      entries[file.uri.pathSegments.last] = (
-        size: stat.size,
-        used: stat.modified,
-      );
-      bytes += stat.size;
+      final key = file.uri.pathSegments.last;
+      entries[key] = _DiskEntry(key, stat.size, stat.modified);
     }
-    _diskEntries = entries;
-    _diskBytes = bytes;
+    // Sort only at initial discovery. Thereafter remove/reinsert on each hit
+    // keeps insertion order as LRU, including accesses within one clock tick.
+    final ordered = entries.values.toList()
+      ..sort((a, b) {
+        final time = a.used.compareTo(b.used);
+        return time != 0 ? time : a.key.compareTo(b.key);
+      });
+    _diskEntries = {for (final entry in ordered) entry.key: entry};
+    _diskBytes = entries.values.fold(0, (sum, entry) => sum + entry.size);
   }
 
   Future<void> _trimDisk(Directory root) async {
-    if (_diskBytes <= diskLimit && _diskEntries!.length <= 10000) return;
-    final entries = _diskEntries!.entries.toList()
-      ..sort((a, b) => a.value.used.compareTo(b.value.used));
-    for (final entry in entries) {
-      if (_diskBytes <= diskLimit && _diskEntries!.length <= 10000) break;
+    while (_diskBytes > diskLimit || _diskEntries!.length > 10000) {
+      final entry = _diskEntries!.values.first;
       final file = File('${root.path}/${entry.key}');
       if (await file.exists()) await file.delete();
       _forgetDisk(entry.key);
@@ -242,6 +318,7 @@ class ThumbnailCache extends ChangeNotifier {
     final old = settings;
     settings = value;
     _diskEpoch++;
+    _cancelPersistence();
     // Revisit visible thumbnails under the new policy, including memory hits
     // generated before the user opted into persistent caching.
     for (final key in _memory.keys.toList()) {
@@ -257,21 +334,35 @@ class ThumbnailCache extends ChangeNotifier {
     if (!_disposed) notifyListeners();
   }
 
-  Future<void> clearDisk({bool? encrypted}) => _disk(() async {
-    final root = await _root();
-    _diskEntries = null;
-    _diskBytes = 0;
-    if (!await root.exists()) return;
-    await for (final file in root.list(followLinks: false)) {
-      if (file is File &&
-          (encrypted == null ||
-              file.uri.pathSegments.last.startsWith(encrypted ? 'b-' : 'p-'))) {
-        await file.delete();
+  Future<void> clearDisk({bool? encrypted}) {
+    _diskEpoch++;
+    _cancelPersistence();
+    final result = _disk(() async {
+      final root = await _root();
+      _diskEntries = null;
+      _diskBytes = 0;
+      if (!await root.exists()) return;
+      await for (final file in root.list(followLinks: false)) {
+        if (file is File &&
+            (encrypted == null ||
+                file.uri.pathSegments.last.startsWith(
+                  encrypted ? 'b-' : 'p-',
+                ))) {
+          await file.delete();
+        }
       }
-    }
-  });
+    });
+    // New reads cannot consume files that an in-flight clear is about to remove.
+    _readBarrier = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
+  }
+
   Future<void> clear() async {
     _diskEpoch++;
+    _cancelPersistence();
     for (final job in _jobs.values) {
       job.cancel();
     }
@@ -287,6 +378,7 @@ class ThumbnailCache extends ChangeNotifier {
   }
 
   void cancelScope(ThumbnailScope scope) {
+    _cancelPersistence(scope);
     for (final job in _jobs.values) {
       if (identical(job.scope, scope)) job.cancel();
     }
@@ -378,7 +470,7 @@ class ThumbnailCache extends ChangeNotifier {
     }
     var job = _jobs[key];
     if (job == null || job.cancelled) {
-      job = _Job(scope, path, entry, key, _diskKey(scope, hash));
+      job = _Job(scope, path, entry, key, _diskKey(scope, hash), _diskEpoch);
       _jobs[key] = job;
       _lookupQueue.add(job);
       scheduleMicrotask(_pump);
@@ -521,18 +613,11 @@ class ThumbnailCache extends ChangeNotifier {
       }
       job.check();
       if (value != null) {
-        // Display the decoded frame before encoding/writing a persistent copy.
-        // The extra handle remains valid even if the memory cache is evicted.
         timer.cancel();
-        final persistent = value.clone();
         _publish(job, value);
+        _enqueuePersistence(job, value);
         outcome = 'ready';
         value = null;
-        try {
-          await _writeDisk(job, persistent);
-        } finally {
-          persistent.dispose();
-        }
       } else {
         _recordFailure(job, terminal: true);
         job.done.complete();
@@ -584,7 +669,7 @@ class ThumbnailCache extends ChangeNotifier {
   void _recordFailure(_Job job, {required bool terminal}) {
     _rememberFailure(job.diskKey, terminal: terminal);
     if (terminal) {
-      unawaited(_writeDiskEntry(job, {'unavailable': true}, failure: true));
+      _enqueuePersistence(job, null);
     }
   }
 
@@ -604,103 +689,133 @@ class ThumbnailCache extends ChangeNotifier {
   }
 
   Future<Thumbnail?> _readDisk(_Job job) async {
-    if (!_persistent(job.scope)) return null;
+    final clock = Stopwatch()..start();
+    var outcome = 'disabled';
     try {
+      if (!_persistent(job.scope)) return null;
       final epoch = _diskEpoch;
-      final data = await _disk(() async {
-        job.check();
-        if (epoch != _diskEpoch || !_persistent(job.scope)) return null;
-        final file = File('${(await _root()).path}/${job.diskKey}');
-        final stat = await file.stat();
-        if (stat.type != FileSystemEntityType.file || stat.size > 1024 * 1024) {
-          _forgetDisk(job.diskKey);
-          return null;
-        }
-        final result = jsonDecode(await file.readAsString()) as Map;
-        final now = DateTime.now();
-        if (_diskEntries != null) {
-          _forgetDisk(job.diskKey);
-          _diskEntries![job.diskKey] = (size: stat.size, used: now);
-          _diskBytes += stat.size;
-        }
-        // Persist approximate LRU age, without a metadata write on every hit.
-        if (now.difference(stat.modified).inSeconds >= 60) {
-          try {
-            await file.setLastModified(now);
-          } on FileSystemException {
-            /* Read-only caches still serve hits. */
-          }
-        }
-        return result;
-      });
-      job.check();
-      if (data == null || epoch != _diskEpoch || !_persistent(job.scope)) {
+      bool current() =>
+          job.valid &&
+          !_disposed &&
+          epoch == _diskEpoch &&
+          _persistent(job.scope);
+      outcome = 'stale';
+      await _readBarrier;
+      if (!current()) return null;
+      // The lookup lane is bounded by _lookups, independently of writes/indexing.
+      // Atomic rename means a concurrent read sees either a complete file or a miss.
+      final file = File('${(await _root()).path}/${job.diskKey}');
+      final stat = await file.stat();
+      if (stat.type != FileSystemEntityType.file || stat.size > 1024 * 1024) {
+        outcome = 'miss';
         return null;
       }
+      final data = jsonDecode(await file.readAsString()) as Map;
+      if (!current()) return null;
+      final now = DateTime.now();
+      // Do not resurrect an entry removed by a concurrent eviction.
+      if (_diskEntries?.containsKey(job.diskKey) == true) {
+        _rememberDisk(job.diskKey, stat.size, now);
+      }
+      if (now.difference(stat.modified).inSeconds >= 60) {
+        try {
+          await file.setLastModified(now);
+        } on FileSystemException {
+          /* Read-only hit. */
+        }
+      }
+      if (!current()) return null;
       if (data['unavailable'] == true) {
+        outcome = 'unavailable';
         job.knownUnavailable = true;
         _rememberFailure(job.diskKey, terminal: true);
         return null;
       }
-      final image = await _decode(base64Decode(data['png'] as String));
-      return Thumbnail(image, Duration(milliseconds: data['duration'] as int));
+      final duration = Duration(milliseconds: data['duration'] as int);
+      final bytes = base64Decode(data['png'] as String);
+      late ui.Image image;
+      try {
+        image = await _decode(bytes);
+      } finally {
+        bytes.fillRange(0, bytes.length, 0);
+      }
+      if (!current()) {
+        image.dispose();
+        return null;
+      }
+      outcome = 'hit';
+      return Thumbnail(image, duration);
     } catch (_) {
+      outcome = 'failed';
       return null;
+    } finally {
+      _trace(job, {
+        'phase': 'lookup',
+        'outcome': outcome,
+        'elapsed_ms': clock.elapsedMilliseconds,
+      });
     }
   }
 
-  Future<void> _writeDisk(_Job job, Thumbnail value) async {
-    if (!_persistent(job.scope)) return;
-    final epoch = _diskEpoch;
+  Future<bool> _writeDisk(_Persistence item) async {
+    if (!_current(item)) return false;
+    final value = item.value;
+    if (value == null) return _writeDiskEntry(item, {'unavailable': true});
+    await persistenceHook?.call('encode');
+    if (!_current(item)) return false;
     final bytes = await value.image.toByteData(format: ui.ImageByteFormat.png);
-    if (bytes == null || epoch != _diskEpoch) return;
-    await _writeDiskEntry(job, {
-      'png': base64Encode(bytes.buffer.asUint8List()),
-      'duration': value.duration.inMilliseconds,
-    });
+    if (bytes == null) return false;
+    final buffer = bytes.buffer.asUint8List(
+      bytes.offsetInBytes,
+      bytes.lengthInBytes,
+    );
+    try {
+      if (!_current(item)) return false;
+      return await _writeDiskEntry(item, {
+        'png': base64Encode(buffer),
+        'duration': value.duration.inMilliseconds,
+      });
+    } finally {
+      buffer.fillRange(0, buffer.length, 0);
+    }
   }
 
-  Future<void> _writeDiskEntry(
-    _Job job,
-    Map<String, dynamic> data, {
-    bool failure = false,
-  }) async {
-    if (!_persistent(job.scope)) return;
-    final epoch = _diskEpoch;
-    bool current() =>
-        !_disposed &&
-        job.scope.available &&
-        (!job.cancelled || (failure && job.timedOut)) &&
-        epoch == _diskEpoch &&
-        _persistent(job.scope);
-    try {
-      await _disk(() async {
-        if (!current()) return;
+  Future<bool> _writeDiskEntry(_Persistence item, Map<String, dynamic> data) =>
+      _disk(() async {
+        if (!_current(item)) return false;
         final root = await _root();
+        if (!_current(item)) return false;
         await root.create(recursive: true);
         await _indexDisk(root);
-        final destination = File('${root.path}/${job.diskKey}');
-        if (_diskEntries!.containsKey(job.diskKey)) return;
+        if (!_current(item)) return false;
+        final key = item.job.diskKey;
+        final destination = File('${root.path}/$key');
+        if (_diskEntries!.containsKey(key)) return false;
+        final encoded = jsonEncode(data);
+        if (encoded.length > 1024 * 1024) return false;
         final temporary = File('${destination.path}.tmp');
         try {
-          final encoded = jsonEncode(data);
+          await persistenceHook?.call('write');
+          if (!_current(item)) return false;
           await temporary.writeAsString(encoded);
-          if (!current()) return;
+          if (!_current(item)) return false;
           await temporary.rename(destination.path);
-          _diskEntries![job.diskKey] = (
-            size: encoded.length,
-            used: DateTime.now(),
-          );
-          _diskBytes += encoded.length;
+          // Revocation can happen while rename is in flight, too.
+          try {
+            await persistenceHook?.call('renamed');
+          } finally {
+            if (!_current(item) && await destination.exists()) {
+              await destination.delete();
+            }
+          }
+          if (!_current(item)) return false;
+          _rememberDisk(key, encoded.length, DateTime.now());
           await _trimDisk(root);
+          return true;
         } finally {
           if (await temporary.exists()) await temporary.delete();
         }
       });
-    } catch (_) {
-      /* Cache failures must not prevent browsing. */
-    }
-  }
 
   static Future<ui.Image> _decode(Uint8List bytes) async {
     final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
@@ -807,17 +922,16 @@ class ThumbnailCache extends ChangeNotifier {
     try {
       job.check();
       if (reader.size > 16 * 1024 * 1024) return null;
-      final output = BytesBuilder(copy: false);
-      for (var offset = 0; offset < reader.size;) {
+      final bytes = await reader.readAll(
+        limit: 16 * 1024 * 1024,
+        check: job.check,
+      );
+      try {
         job.check();
-        final buffer = Uint8List(math.min(64 * 1024, reader.size - offset));
-        final count = await reader.read(buffer, offset, buffer.length);
-        if (count == 0) return null;
-        output.add(buffer);
-        offset += count;
+        return Thumbnail(await _decode(bytes), Duration.zero);
+      } finally {
+        bytes.fillRange(0, bytes.length, 0);
       }
-      job.check();
-      return Thumbnail(await _decode(output.takeBytes()), Duration.zero);
     } finally {
       job.cleanups.remove(reader.close);
       await reader.close();
@@ -828,6 +942,7 @@ class ThumbnailCache extends ChangeNotifier {
   void dispose() {
     _disposed = true;
     _diskEpoch++;
+    _cancelPersistence();
     for (final job in _jobs.values) {
       job.cancel();
       if (!job.done.isCompleted) job.done.complete();

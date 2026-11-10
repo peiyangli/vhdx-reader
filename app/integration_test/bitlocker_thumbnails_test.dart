@@ -46,21 +46,42 @@ void main() {
     final directory = await Directory.systemTemp.createTemp(
       'bitlocker-thumbs-',
     );
+    final fileCache = await Directory.systemTemp.createTemp(
+      'thumbnail-file-cache-',
+    );
     final backend = FixtureBackend(await NativeBackend.start(), root);
+    final traces = <Map<String, dynamic>>[];
+    String? sourceRevision;
     var cache = ThumbnailCache(
       directory: directory,
+      onTrace: traces.add,
       settings: const CacheSettings(bitLockerThumbnailDisk: true),
       onError: (e) => debugPrint('THUMB ERROR: $e'),
     );
     ThumbnailScope? scope;
     var generatedBeforeReopen = 0;
     try {
+      final configured = await backend.request({
+        'op': 'disk_cache_configure',
+        'cache_enabled': true,
+        'enabled': true,
+        'directory': fileCache.path,
+        'max_gib': 1,
+        'retention_days': 0,
+      });
+      expect(configured['enabled'], isTrue);
       for (var pass = 0; pass < 2; pass++) {
         final opened = await backend.request({
           'op': 'open',
           'path': '$root/bitlockervhdx.vhdx',
         });
-        debugPrint('SOURCE REVISION: ${opened['source_revision']}');
+        expect(opened['source_revision'], isA<String>());
+        sourceRevision ??= opened['source_revision'] as String;
+        expect(
+          opened['source_revision'],
+          sourceRevision,
+          reason: 'An unchanged image must keep its namespace across reopen',
+        );
         await backend.request({
           'op': 'unlock',
           'partition': 1,
@@ -143,6 +164,17 @@ void main() {
           );
         }
         if (pass == 1) {
+          final lookups = traces.where((e) => e['phase'] == 'lookup').toList();
+          expect(
+            lookups.where((e) => e['outcome'] == 'hit'),
+            hasLength(expected),
+          );
+          expect(
+            lookups.where((e) => e['outcome'] == 'unavailable'),
+            hasLength(1),
+          );
+          expect(traces.where((e) => e['phase'] == 'generation'), isEmpty);
+          debugPrint('REOPEN_CACHE hits=$expected unavailable=1 regenerated=0');
           expect(
             backend.mediaPaths.length,
             generatedBeforeReopen,
@@ -151,6 +183,7 @@ void main() {
           );
         }
         generatedBeforeReopen = backend.mediaPaths.length;
+        await cache.persistenceIdle;
         for (var i = 0; i < 100; i++) {
           if ((await directory.list().toList())
                   .whereType<File>()
@@ -182,8 +215,10 @@ void main() {
         scope.invalidate();
         await backend.request({'op': 'lock'});
         cache.dispose();
+        traces.clear();
         cache = ThumbnailCache(
           directory: directory,
+          onTrace: traces.add,
           settings: const CacheSettings(bitLockerThumbnailDisk: true),
         );
       }
@@ -191,8 +226,10 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
       scope?.invalidate();
       cache.dispose();
+      await cache.persistenceIdle;
       await backend.dispose();
       await directory.delete(recursive: true);
+      await fileCache.delete(recursive: true);
     }
   });
   testWidgets('full Windows browser displays BitLocker thumbnails while idle', (

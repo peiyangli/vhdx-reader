@@ -24,18 +24,56 @@ abstract class ReaderBackend {
   Future<void> dispose();
 }
 
+/// Optional capability: test/remote backends can retain the JSON contract.
+abstract class BinaryReaderBackend {
+  int get readEpoch;
+  Future<Uint8List> readFileBytes(int file, int offset, int length);
+}
+
+extension ReaderBytes on ReaderBackend {
+  Future<Uint8List> readFileBytes(int file, int offset, int length) async {
+    final backend = this;
+    if (backend is BinaryReaderBackend) {
+      return (backend as BinaryReaderBackend).readFileBytes(
+        file,
+        offset,
+        length,
+      );
+    }
+    final data = await request({
+      'op': 'file_read',
+      'file': file,
+      'offset': offset,
+      'length': length,
+    });
+    return base64Decode(data['bytes'] as String);
+  }
+}
+
 class _Bindings {
   _Bindings(String path) : library = DynamicLibrary.open(path) {
     final version = library.lookupFunction<Uint32 Function(), int Function()>(
       'vhdx_api_version',
     )();
-    if (version != 9) throw ReaderFailure('version', '读取组件版本不匹配，请重新解压完整程序。');
+    if (version != 10) throw ReaderFailure('version', '读取组件版本不匹配，请重新解压完整程序。');
     NativeMedia.library = library;
     request = library
         .lookupFunction<
           Pointer<Utf8> Function(Uint64, Pointer<Uint8>, UintPtr),
           Pointer<Utf8> Function(int, Pointer<Uint8>, int)
         >('vhdx_request');
+    readFile = library
+        .lookupFunction<
+          Pointer<Utf8> Function(
+            Uint64,
+            Uint64,
+            Uint64,
+            Uint64,
+            UintPtr,
+            Pointer<Uint8>,
+          ),
+          Pointer<Utf8> Function(int, int, int, int, int, Pointer<Uint8>)
+        >('vhdx_file_read');
     free = library
         .lookupFunction<
           Void Function(Pointer<Utf8>),
@@ -48,6 +86,47 @@ class _Bindings {
   final DynamicLibrary library;
   late final Pointer<Utf8> Function(int, Pointer<Uint8>, int) request;
   late final void Function(Pointer<Utf8>) free;
+  late final Pointer<Utf8> Function(int, int, int, int, int, Pointer<Uint8>)
+  readFile;
+
+  Map<String, dynamic> callBytes(int context, Map<String, dynamic> request) {
+    final length = request['length'] as int;
+    if (length < 0 || length > 1024 * 1024 || (request['offset'] as int) < 0) {
+      throw ReaderFailure('invalid', '读取范围无效。');
+    }
+    final buffer = calloc<Uint8>(length == 0 ? 1 : length);
+    Pointer<Utf8> metadata = nullptr;
+    try {
+      metadata = readFile(
+        context,
+        request['session'] as int,
+        request['file'] as int,
+        request['offset'] as int,
+        length,
+        buffer,
+      );
+      if (metadata == nullptr) throw ReaderFailure('internal', '读取组件没有返回结果。');
+      final response =
+          jsonDecode(metadata.toDartString()) as Map<String, dynamic>;
+      if (response['ok'] == true) {
+        final data = response['data'] as Map<String, dynamic>;
+        final count = data['length'] as int;
+        if (count < 0 || count > length) {
+          throw ReaderFailure('internal', '读取长度无效。');
+        }
+        // Copies once into VM-owned transferable storage; no Base64 or UI decode.
+        data['bytes'] = TransferableTypedData.fromList([
+          buffer.asTypedList(count),
+        ]);
+      }
+      return response;
+    } finally {
+      buffer.asTypedList(length).fillRange(0, length, 0);
+      calloc.free(buffer);
+      if (metadata != nullptr) free(metadata);
+    }
+  }
+
   late final void Function(int) cancel;
   int createContext() =>
       library.lookupFunction<Uint64 Function(), int Function()>(
@@ -82,7 +161,12 @@ void _readerIsolate(List<Object> args) {
       final id = message[0] as int;
       final request = Map<String, dynamic>.from(message[1] as Map);
       try {
-        parent.send([id, bindings.call(args[2] as int, request)]);
+        parent.send([
+          id,
+          message.length > 2 && message[2] == true
+              ? bindings.callBytes(args[2] as int, request)
+              : bindings.call(args[2] as int, request),
+        ]);
       } catch (_) {
         parent.send([
           id,
@@ -105,7 +189,7 @@ void _readerIsolate(List<Object> args) {
   }
 }
 
-class NativeBackend implements ReaderBackend {
+class NativeBackend implements ReaderBackend, BinaryReaderBackend {
   NativeBackend._(this._bindings, this._inbox, this._nativeDirectory)
     : _context = _bindings.createContext();
   final String? _nativeDirectory;
@@ -117,6 +201,9 @@ class NativeBackend implements ReaderBackend {
   late final SendPort _commands;
   int _nextId = 0;
   int _session = 0;
+  @override
+  int get readEpoch => _readEpoch;
+  int _readEpoch = 0;
   bool _cancelled = false;
   bool _disposed = false;
   int? _imageHandle;
@@ -161,9 +248,21 @@ class NativeBackend implements ReaderBackend {
       } else if (message[0] == 'startup_error') {
         ready.completeError(ReaderFailure('native', message[1] as String));
       } else {
-        backend._pending
-            .remove(message[0])
-            ?.complete(Map<String, dynamic>.from(message[1] as Map));
+        final response = Map<String, dynamic>.from(message[1] as Map);
+        final data = response['data'];
+        Uint8List? bytes;
+        if (data is Map && data['bytes'] is TransferableTypedData) {
+          bytes = (data['bytes'] as TransferableTypedData)
+              .materialize()
+              .asUint8List();
+          data['bytes'] = bytes;
+        }
+        final pending = backend._pending.remove(message[0]);
+        if (pending == null) {
+          bytes?.fillRange(0, bytes.length, 0);
+        } else {
+          pending.complete(response);
+        }
       }
     });
     backend._isolate = await Isolate.spawn(_readerIsolate, [
@@ -186,6 +285,7 @@ class NativeBackend implements ReaderBackend {
   @override
   void cancel() {
     _cancelled = true;
+    _readEpoch++;
     _bindings.cancel(_context);
   }
 
@@ -237,7 +337,24 @@ class NativeBackend implements ReaderBackend {
     }
   }
 
-  Future<Map<String, dynamic>> _requestRaw(Map<String, dynamic> request) async {
+  @override
+  Future<Uint8List> readFileBytes(int file, int offset, int length) async {
+    if (offset < 0 || length < 0 || length > 1024 * 1024) {
+      throw ReaderFailure('invalid', '读取范围无效。');
+    }
+    final data = await _requestRaw({
+      'op': 'file_read',
+      'file': file,
+      'offset': offset,
+      'length': length,
+    }, binary: true);
+    return data['bytes'] as Uint8List;
+  }
+
+  Future<Map<String, dynamic>> _requestRaw(
+    Map<String, dynamic> request, {
+    bool binary = false,
+  }) async {
     if (_disposed) throw ReaderFailure('closed', '读取组件已关闭。');
     // Revocation must still reach the worker after an operation was cancelled.
     // Otherwise disposing a cancelled preview leaks its live media capability.
@@ -247,6 +364,7 @@ class NativeBackend implements ReaderBackend {
           'disk_cache_clear',
           'disk_cache_status',
           'media_close',
+          'file_close',
           'thumbnail_cancel',
           'thumbnail_finish',
         }.contains(request['op'])) {
@@ -273,6 +391,17 @@ class NativeBackend implements ReaderBackend {
       return Map<String, dynamic>.from(response['data'] as Map);
     }
     if (_pending.length >= 8) throw ReaderFailure('busy', '操作过多，请稍后重试。');
+    if ({
+      'open',
+      'unlock',
+      'unlock_saved',
+      'lock',
+      'close',
+      'dispose',
+    }.contains(request['op'])) {
+      _readEpoch++;
+    }
+    final epoch = _readEpoch;
     final id = _nextId++;
     final complete = Completer<Map<String, dynamic>>();
     _pending[id] = complete;
@@ -292,8 +421,15 @@ class NativeBackend implements ReaderBackend {
         }.contains(request['op']))
           'session': _session,
       },
+      binary,
     ]);
     final response = await complete.future;
+    if (binary && (_disposed || _cancelled || epoch != _readEpoch)) {
+      final bytes = (response['data'] as Map?)?['bytes'];
+      if (bytes is Uint8List) bytes.fillRange(0, bytes.length, 0);
+      throw ReaderFailure('cancelled', '此读取已取消或会话已关闭。');
+    }
+    if (response['invalidated'] == true) _readEpoch++;
     if (response['session'] is int) _session = response['session'] as int;
     if (response['ok'] != true) {
       final error = response['error'] as Map;

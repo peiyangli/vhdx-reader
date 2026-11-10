@@ -246,9 +246,9 @@ void main() {
       );
       await tester.pumpAndSettle();
       await openReaderSettings(tester);
-      await tester.scrollUntilVisible(
+      await ensureReaderSettingVisible(
+        tester,
         find.byKey(const Key('cache-plaintext')),
-        100,
       );
       await tester.tap(find.byKey(const Key('cache-plaintext')));
       await tester.pumpAndSettle();

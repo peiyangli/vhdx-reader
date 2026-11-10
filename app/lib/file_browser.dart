@@ -1,81 +1,17 @@
 import 'dart:ui' show PointerDeviceKind;
+import 'dart:math' as math;
+import 'file_order.dart';
+export 'file_order.dart';
 import 'package:flutter/material.dart';
 import 'preview.dart';
 import 'thumbnails.dart';
 import 'screen_layout.dart';
-
-enum FileSort { name, size, modified, type }
-
-List<Map<String, dynamic>> sortedFiles(
-  List<Map<String, dynamic>> source,
-  FileSort sort,
-  bool descending,
-) => [...source]
-  ..sort((a, b) {
-    final folders =
-        (b['directory'] == true ? 1 : 0) - (a['directory'] == true ? 1 : 0);
-    if (folders != 0) return folders;
-    var result = 0;
-    if (sort == FileSort.modified) {
-      final left = a['modified_unix_ms'] as int?;
-      final right = b['modified_unix_ms'] as int?;
-      // Unknown dates stay at the end in both directions.
-      if (left == null && right != null) return 1;
-      if (left != null && right == null) return -1;
-      if (left != null && right != null) result = left.compareTo(right);
-    }
-    if (a['directory'] != true) {
-      if (sort == FileSort.size) {
-        result = (a['size'] as int).compareTo(b['size'] as int);
-      } else if (sort == FileSort.type) {
-        result = friendlyTypeOrder(
-          a['name'] as String,
-        ).compareTo(friendlyTypeOrder(b['name'] as String));
-      }
-    }
-    if (result == 0) {
-      result = compareFileNames(a['name'] as String, b['name'] as String);
-    }
-    return descending ? -result : result;
-  });
-
-/// Neighbours follow the visible directory's sort order and never wrap.
-Map<String, dynamic>? adjacentVideo(
-  List<Map<String, dynamic>> entries,
-  String? current,
-  int step,
-  FileSort sort,
-  bool descending,
-) {
-  final videos = sortedFiles(entries, sort, descending)
-      .where((e) => e['directory'] != true && isVideo(e['name'] as String))
-      .toList();
-  final index = videos.indexWhere((e) => e['name'] == current);
-  final next = index + step;
-  return index < 0 || next < 0 || next >= videos.length ? null : videos[next];
-}
 
 String fileType(String name) {
   final dot = name.lastIndexOf('.');
   return dot <= 0 || dot == name.length - 1
       ? ''
       : name.substring(dot + 1).toLowerCase();
-}
-
-int compareFileNames(String a, String b) {
-  final pieces = RegExp(r'\d+|\D+');
-  final left = pieces.allMatches(a.toLowerCase()).map((m) => m[0]!).toList();
-  final right = pieces.allMatches(b.toLowerCase()).map((m) => m[0]!).toList();
-  for (var i = 0; i < left.length && i < right.length; i++) {
-    final x = left[i];
-    final y = right[i];
-    final nx = BigInt.tryParse(x);
-    final ny = BigInt.tryParse(y);
-    final order = nx != null && ny != null ? nx.compareTo(ny) : x.compareTo(y);
-    if (order != 0) return order;
-  }
-  final length = left.length.compareTo(right.length);
-  return length != 0 ? length : a.compareTo(b);
 }
 
 String fileDate(Object? value) {
@@ -85,7 +21,7 @@ String fileDate(Object? value) {
   return '${date.year}/${two(date.month)}/${two(date.day)}  ${two(date.hour)}:${two(date.minute)}';
 }
 
-class FileContents extends StatelessWidget {
+class FileContents extends StatefulWidget {
   const FileContents({
     super.key,
     required this.entries,
@@ -98,8 +34,16 @@ class FileContents extends StatelessWidget {
     this.selected,
     this.thumbnailScope,
     this.directory = '/',
+    this.order,
+    this.loading = false,
+    this.incomplete = false,
   });
+
+  /// Immutable entry snapshot; replace the list when metadata changes.
   final List<Map<String, dynamic>> entries;
+  final FileOrderSnapshot? order;
+  final bool loading;
+  final bool incomplete;
   final bool grid;
   final FileSort sort;
   final bool descending;
@@ -118,15 +62,18 @@ class FileContents extends StatelessWidget {
   );
 
   @override
-  Widget build(BuildContext context) => LayoutBuilder(
-    builder: (context, constraints) => _contents(context, constraints),
-  );
+  State<FileContents> createState() => FileContentsState();
 
-  Widget _contents(BuildContext context, BoxConstraints constraints) {
+  Widget _contents(
+    BuildContext context,
+    BoxConstraints constraints,
+    FileOrderSnapshot order,
+    ScrollController scroll,
+  ) {
     final layout = ScreenLayout(context);
     final inline = constraints.maxWidth >= 600 && layout.textScale < 1.4;
     final compact = layout.compact;
-    final files = sortedFiles(entries, sort, descending);
+    final files = order.entries;
     Widget contents;
     if (files.isEmpty) {
       contents = CustomScrollView(
@@ -144,8 +91,12 @@ class FileContents extends StatelessWidget {
                     color: Color(0xffb4bdc9),
                   ),
                   const SizedBox(height: 12),
-                  const Text(
-                    '此文件夹为空',
+                  Text(
+                    loading
+                        ? '正在读取目录…'
+                        : incomplete
+                        ? '目录未读完，请下拉刷新'
+                        : '此文件夹为空',
                     style: TextStyle(color: Color(0xff7b8492)),
                   ),
                   if (onRefresh != null)
@@ -168,6 +119,9 @@ class FileContents extends StatelessWidget {
     } else if (grid) {
       contents = GridView.builder(
         key: PageStorageKey('$storageKey-grid'),
+        controller: scroll,
+        findChildIndexCallback: (key) =>
+            key is ValueKey<String> ? order.indexOf(key.value) : null,
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.all(16),
         gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
@@ -209,6 +163,9 @@ class FileContents extends StatelessWidget {
     } else {
       contents = ListView.builder(
         key: PageStorageKey('$storageKey-list'),
+        controller: scroll,
+        findChildIndexCallback: (key) =>
+            key is ValueKey<String> ? order.indexOf(key.value) : null,
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 10),
         itemExtent: inline ? 48 : 62 + (layout.textScale - 1).clamp(0, 2) * 36,
@@ -295,6 +252,7 @@ class FileContents extends StatelessWidget {
   }
 
   Widget _item(Map<String, dynamic> file, Widget child) => Material(
+    key: ValueKey(file['name'] as String),
     color: selected == file['name']
         ? const Color(0xffeaf1fc)
         : Colors.transparent,
@@ -306,4 +264,102 @@ class FileContents extends StatelessWidget {
       child: child,
     ),
   );
+}
+
+class FileContentsState extends State<FileContents> {
+  final _cache = FileOrderCache();
+  final _listScroll = ScrollController();
+  final _gridScroll = ScrollController();
+  FileOrderSnapshot? _lastOrder;
+  FileSort? _lastSort;
+  bool? _lastDescending;
+  bool? _lastGrid;
+  String? _lastStorageKey;
+  double _stride = 1;
+  double _padding = 0;
+  int _columns = 1;
+  int _anchorRevision = 0;
+
+  /// The same snapshot is reused across selection and layout-only rebuilds.
+  FileOrderSnapshot get currentOrder => _lastOrder!;
+
+  @override
+  void dispose() {
+    _anchorRevision++;
+    _listScroll.dispose();
+    _gridScroll.dispose();
+    super.dispose();
+  }
+
+  Widget _build(BuildContext context, BoxConstraints constraints) {
+    final order =
+        widget.order ??
+        _cache.resolve(widget.entries, widget.sort, widget.descending);
+    final scroll = widget.grid ? _gridScroll : _listScroll;
+    final layout = ScreenLayout(context);
+    final inline = constraints.maxWidth >= 600 && layout.textScale < 1.4;
+    final columns = widget.grid
+        ? math.max(1, ((constraints.maxWidth - 32) / 168).ceil())
+        : 1;
+    final stride = widget.grid
+        ? (layout.compact ? 124.0 : 162.0) +
+              (layout.textScale - 1).clamp(0, 2) * 40 +
+              8
+        : (inline ? 48.0 : 62.0 + (layout.textScale - 1).clamp(0, 2) * 36);
+    final padding = widget.grid ? 16.0 : 8.0;
+    final old = _lastOrder;
+    if (old != null &&
+        scroll.hasClients &&
+        _lastStorageKey == widget.storageKey &&
+        _lastGrid == widget.grid) {
+      final sortingChanged =
+          _lastSort != widget.sort || _lastDescending != widget.descending;
+      if (sortingChanged) {
+        _restore(scroll, 0, scroll.offset);
+      } else if (!identical(old, order) &&
+          old.entries.isNotEmpty &&
+          scroll.offset > _padding &&
+          columns == _columns &&
+          stride == _stride) {
+        final row = ((scroll.offset - _padding) / _stride).floor();
+        final index = (row * _columns).clamp(0, old.entries.length - 1);
+        final next = order.indexOf(old.entries[index]['name'] as String);
+        if (next != null) {
+          final within = scroll.offset - _padding - row * _stride;
+          _restore(
+            scroll,
+            padding + (next ~/ columns) * stride + within,
+            scroll.offset,
+          );
+        }
+      }
+    }
+    _lastOrder = order;
+    _lastSort = widget.sort;
+    _lastDescending = widget.descending;
+    _lastGrid = widget.grid;
+    _lastStorageKey = widget.storageKey;
+    _columns = columns;
+    _stride = stride;
+    _padding = padding;
+    return widget._contents(context, constraints, order, scroll);
+  }
+
+  void _restore(ScrollController scroll, double target, double original) {
+    final revision = ++_anchorRevision;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || revision != _anchorRevision || !scroll.hasClients) return;
+      // Do not fight a user gesture that moved after this build.
+      if ((scroll.offset - original).abs() > 0.5) return;
+      final position = scroll.position;
+      final offset = target.clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      );
+      if ((scroll.offset - offset).abs() > 0.5) scroll.jumpTo(offset);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => LayoutBuilder(builder: _build);
 }

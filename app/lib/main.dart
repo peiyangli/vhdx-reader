@@ -889,6 +889,10 @@ class ReaderHome extends StatefulWidget {
   State<ReaderHome> createState() => _ReaderHomeState();
 }
 
+class _DirectoryLoad {
+  bool cancelled = false;
+}
+
 class _ReaderHomeState extends State<ReaderHome> {
   final _password = TextEditingController();
   final _desktopFocus = FocusNode();
@@ -923,7 +927,21 @@ class _ReaderHomeState extends State<ReaderHome> {
   String _status = '';
   String? _error;
   String _path = '/';
-  List<Map<String, dynamic>> _entries = [];
+  DirectoryOrder _directoryOrder = DirectoryOrder();
+  late FileOrderSnapshot _ordered = _directoryOrder.snapshot(
+    _sort,
+    _descending,
+  );
+  List<Map<String, dynamic>> get _entries => _ordered.entries;
+  _DirectoryLoad? _listing;
+  bool get _directoryLoading => _listing != null;
+  bool _directoryPartial = false;
+  bool _hasDirectory = false;
+  bool _reloadDirectoryPending = false;
+  Completer<void>? _operationDone;
+  String get _directorySummary => _directoryPartial
+      ? '已加载 ${_entries.length} 项（未完成）'
+      : '${_entries.length} 个项目';
   final _shell = GlobalKey<ScaffoldState>();
   bool _drawerOpen = false;
   Map<String, dynamic>? _selected;
@@ -957,17 +975,21 @@ class _ReaderHomeState extends State<ReaderHome> {
         if (mounted) _desktopFocus.requestFocus();
       });
     }
-    if (oldWidget.browserSettings.showSystem != _showSystem) {
-      if (_unlocked) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) unawaited(_run('正在读取目录…', () => _load(_path)));
-        });
-      }
+    if (oldWidget.browserSettings.sort != _sort ||
+        oldWidget.browserSettings.descending != _descending) {
+      _ordered = _directoryOrder.snapshot(_sort, _descending);
+    }
+    if (oldWidget.browserSettings.showSystem != _showSystem && _unlocked) {
+      _reloadDirectoryPending = true;
+      if (_directoryLoading) _cancelOperation();
+      _reloadWhenIdle();
     }
   }
 
   @override
   void dispose() {
+    _listing?.cancelled = true;
+    _listing = null;
     _invalidateThumbnails();
     _preview?.dispose();
     _password.clear();
@@ -994,7 +1016,13 @@ class _ReaderHomeState extends State<ReaderHome> {
     _invalidateThumbnails();
     _preview?.dispose();
     _unlocked = false;
-    _entries = [];
+    _listing?.cancelled = true;
+    _listing = null;
+    _directoryOrder = DirectoryOrder();
+    _ordered = _directoryOrder.snapshot(_sort, _descending);
+    _directoryPartial = false;
+    _hasDirectory = false;
+    _reloadDirectoryPending = false;
     _selected = null;
     _preview = null;
     _path = '/';
@@ -1002,6 +1030,8 @@ class _ReaderHomeState extends State<ReaderHome> {
 
   Future<void> _run(String status, Future<void> Function() operation) async {
     if (_busy) return;
+    final done = Completer<void>();
+    _operationDone = done;
     widget.backend.beginOperation();
     widget.onBusyChanged(true);
     setState(() {
@@ -1034,8 +1064,33 @@ class _ReaderHomeState extends State<ReaderHome> {
           _status = '';
         });
         _syncThumbnails();
+        _reloadWhenIdle();
       }
+      _operationDone = null;
+      done.complete();
     }
+  }
+
+  void _cancelOperation() {
+    _listing?.cancelled = true;
+    widget.backend.cancel();
+    if (mounted) setState(() => _status = '正在取消…');
+  }
+
+  Future<void> _stopListing() async {
+    if (!_directoryLoading) return;
+    final done = _operationDone;
+    _cancelOperation();
+    if (done != null) await done.future;
+  }
+
+  void _reloadWhenIdle() {
+    if (!_reloadDirectoryPending || !mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _busy || !_unlocked || !_reloadDirectoryPending) return;
+      _reloadDirectoryPending = false;
+      unawaited(_run('正在读取目录…', () => _load(_path)));
+    });
   }
 
   Future<void> _chooseImage() => widget.onOpenImages();
@@ -1214,52 +1269,96 @@ class _ReaderHomeState extends State<ReaderHome> {
       );
       _syncThumbnails();
     }
-    final entries = <Map<String, dynamic>>[];
+    final load = _DirectoryLoad();
+    _listing = load;
+    final showSystem = _showSystem;
+    final directory = DirectoryOrder();
+    var published = false;
+    final sincePublish = Stopwatch()..start();
+    if (!_hasDirectory) _directoryPartial = true;
     int? next = 0;
-    do {
-      final data = await widget.backend.request({
-        'op': 'list',
-        'path': path,
-        'start': next,
-        'limit': 200,
-        'show_system': _showSystem,
-      });
-      if (!mounted) return;
-      entries.addAll(
-        (data['entries'] as List).map(
-          (e) => Map<String, dynamic>.from(e as Map),
-        ),
-      );
-      final previous = next;
-      next = data['next_index'] as int?;
-      if (next != null && next <= previous!) {
-        throw ReaderFailure('invalid_pagination', '目录读取未能继续，请刷新重试。');
+    bool current() => mounted && identical(_listing, load) && !load.cancelled;
+    try {
+      do {
+        if (!current()) return;
+        final data = await widget.backend.request({
+          'op': 'list',
+          'path': path,
+          'start': next,
+          'limit': 200,
+          'show_system': showSystem,
+        });
+        if (!current()) return;
+        final previous = next!;
+        final following = data['next_index'] as int?;
+        if (following != null && following <= previous) {
+          throw ReaderFailure('invalid_pagination', '目录读取未能继续，请刷新重试。');
+        }
+        directory.add(
+          (data['entries'] as List).map(
+            (e) => Map<String, dynamic>.unmodifiable(e as Map),
+          ),
+        );
+        next = following;
+        final first = !published;
+        if (first ||
+            next == null ||
+            (_entries.isEmpty && directory.length > 0) ||
+            sincePublish.elapsedMilliseconds >= 32) {
+          setState(() {
+            if (first) {
+              _path = path;
+              _directoryOrder = directory;
+              _hasDirectory = true;
+              _previewRevision++;
+              _preview?.dispose();
+              _selected = null;
+              _preview = null;
+            }
+            _ordered = directory.snapshot(_sort, _descending);
+            _directoryPartial = next != null;
+            _status = '正在读取目录… ${_entries.length} 项';
+          });
+          published = true;
+          sincePublish.reset();
+        }
+        if (next != null) {
+          // Guarantee the first page can paint even for immediately completed
+          // backend futures. Later pages yield to input without one frame per page.
+          if (first && widget.active) {
+            await WidgetsBinding.instance.endOfFrame;
+          } else {
+            await Future<void>.delayed(Duration.zero);
+          }
+        }
+      } while (next != null);
+    } on ReaderFailure catch (error) {
+      if (error.invalidated || !load.cancelled) rethrow;
+    } finally {
+      if (mounted && identical(_listing, load)) {
+        setState(() {
+          _listing = null;
+          if (published) {
+            _ordered = directory.snapshot(_sort, _descending);
+            _directoryPartial = next != null;
+          }
+        });
       }
-      if (next != null) {
-        setState(() => _status = '正在读取目录… ${entries.length} 项');
-      }
-    } while (next != null);
-    setState(() {
-      _path = path;
-      _entries = entries;
-      _preview?.dispose();
-      _selected = null;
-      _preview = null;
-    });
+    }
   }
 
-  Map<String, dynamic>? _videoNeighbour(int step) => adjacentVideo(
-    _entries,
-    _selected?['name'] as String?,
-    step,
-    _sort,
-    _descending,
-  );
+  Map<String, dynamic>? _videoNeighbour(int step) =>
+      _ordered.adjacentVideo(_selected?['name'] as String?, step);
 
   Future<void> _select(
     Map<String, dynamic> entry, {
     bool replaceVideo = false,
   }) async {
+    if (_directoryLoading) {
+      final path = _path;
+      await _stopListing();
+      if (!mounted || path != _path || !_entries.contains(entry)) return;
+    }
     if (_busy) return;
     if (entry['directory'] == true) {
       await _run('正在读取目录…', () => _load(_join(entry['name'] as String)));
@@ -1325,6 +1424,23 @@ class _ReaderHomeState extends State<ReaderHome> {
         final maxSize = isText(name) ? 256 * 1024 : 16 * 1024 * 1024;
         if (isImage(name) && size > maxSize) {
           notice = '图片超过 16 MB，请导出查看。';
+        } else if (isImage(name)) {
+          final reader = await BackendRangeReader.open(
+            widget.backend,
+            _join(name),
+          );
+          try {
+            bytes = await reader.readAll(
+              limit: maxSize,
+              check: () {
+                if (!mounted || revision != _previewRevision) {
+                  throw ReaderFailure('cancelled', '图片预览已关闭。');
+                }
+              },
+            );
+          } finally {
+            await reader.close();
+          }
         } else {
           final output = BytesBuilder(copy: false);
           final target = size < maxSize ? size : maxSize;
@@ -1347,6 +1463,7 @@ class _ReaderHomeState extends State<ReaderHome> {
         }
       }
       if (!mounted || revision != _previewRevision) {
+        bytes?.fillRange(0, bytes.length, 0);
         media?.dispose();
         pdf?.dispose();
         return;
@@ -1697,11 +1814,10 @@ class _ReaderHomeState extends State<ReaderHome> {
       return;
     }
     if (_preview?.media != null) {
-      if (_busy) widget.backend.cancel();
+      if (_busy) _cancelOperation();
       _dismissPreview();
     } else if (_busy) {
-      widget.backend.cancel();
-      setState(() => _status = '正在取消…');
+      _cancelOperation();
     } else if (_preview != null) {
       _dismissPreview();
     } else if (_path != '/') {
@@ -1720,7 +1836,8 @@ class _ReaderHomeState extends State<ReaderHome> {
   }
 
   Future<void> _refresh() async {
-    if (widget.active && _unlocked && !_busy) {
+    if (_directoryLoading) await _stopListing();
+    if (mounted && widget.active && _unlocked && !_busy) {
       await _run('正在刷新…', () => _load(_path));
     }
   }
@@ -1798,7 +1915,7 @@ class _ReaderHomeState extends State<ReaderHome> {
                                       _busy
                                           ? _status
                                           : _unlocked
-                                          ? '${_entries.length} 个项目'
+                                          ? _directorySummary
                                           : '就绪',
                                       style: const TextStyle(
                                         fontSize: 11,
@@ -1809,8 +1926,7 @@ class _ReaderHomeState extends State<ReaderHome> {
                                   if (_busy)
                                     TextButton(
                                       onPressed: () {
-                                        widget.backend.cancel();
-                                        setState(() => _status = '正在取消…');
+                                        _cancelOperation();
                                       },
                                       child: const Text('取消'),
                                     ),
@@ -1967,11 +2083,11 @@ class _ReaderHomeState extends State<ReaderHome> {
                   ),
                 ),
               ),
-              if (_unlocked && !_busy)
+              if (_unlocked && (!_busy || _directoryLoading))
                 Padding(
                   padding: const EdgeInsets.only(left: 8),
                   child: Text(
-                    '${_entries.length} 个项目',
+                    _directorySummary,
                     style: const TextStyle(
                       fontSize: 11,
                       color: Color(0xff8590a0),
@@ -2034,8 +2150,7 @@ class _ReaderHomeState extends State<ReaderHome> {
             IconButton(
               tooltip: '取消读取',
               onPressed: () {
-                widget.backend.cancel();
-                setState(() => _status = '正在取消…');
+                _cancelOperation();
               },
               icon: const Icon(Icons.close),
             ),
@@ -2245,7 +2360,11 @@ class _ReaderHomeState extends State<ReaderHome> {
 
   Widget _fileList() {
     return FileContents(
+      key: ValueKey('$_imagePath-$_partition-$_path'),
       entries: _entries,
+      order: _ordered,
+      loading: _directoryLoading,
+      incomplete: _directoryPartial,
       grid: _grid,
       sort: _sort,
       descending: _descending,
@@ -2254,7 +2373,7 @@ class _ReaderHomeState extends State<ReaderHome> {
       thumbnailScope: _thumbnailScope,
       directory: _path,
       onRefresh: _refresh,
-      onOpen: _busy ? null : _select,
+      onOpen: _busy && !_directoryLoading ? null : _select,
     );
   }
 }
