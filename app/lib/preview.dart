@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'video_zoom.dart';
 import 'dart:io';
 import 'dart:convert';
 import 'package:flutter/material.dart';
@@ -65,7 +66,9 @@ class PreviewPane extends StatefulWidget {
     this.onNext,
     this.busy = false,
     this.message,
+    this.videoZoom,
   });
+  final VideoZoomController? videoZoom;
   final PreviewData? data;
   final VoidCallback? onExport;
   final bool active;
@@ -111,6 +114,7 @@ class _PreviewPaneState extends State<PreviewPane> {
       return MediaPreview(
         key: ObjectKey(data!.media),
         source: data.media!,
+        zoom: widget.videoZoom,
         active: widget.active,
         seekSeconds: widget.seekSeconds,
         onExit: widget.onBack ?? () {},
@@ -304,10 +308,19 @@ class PreviewScreen extends StatefulWidget {
   final String? error;
   final bool busy;
   @override
-  State<PreviewScreen> createState() => _PreviewScreenState();
+  State<PreviewScreen> createState() => PreviewScreenState();
 }
 
-class _PreviewScreenState extends State<PreviewScreen> {
+class PreviewScreenState extends State<PreviewScreen> {
+  final _videoZoom = VideoZoomController();
+
+  /// Used by the workspace's system-back handler before closing the preview.
+  bool exitVideoZoom() => _videoZoom.reset();
+
+  void _back() {
+    if (!exitVideoZoom()) widget.onBack();
+  }
+
   void _systemMode(bool full) {
     if (Platform.isAndroid || Platform.isIOS) {
       unawaited(
@@ -328,12 +341,16 @@ class _PreviewScreenState extends State<PreviewScreen> {
   @override
   void didUpdateWidget(covariant PreviewScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (widget.data.media != oldWidget.data.media) {
+      _videoZoom.reset(notify: false);
+    }
     if (widget.active != oldWidget.active) _systemMode(widget.active);
   }
 
   @override
   void dispose() {
     if (widget.active) _systemMode(false);
+    _videoZoom.dispose();
     super.dispose();
   }
 
@@ -345,7 +362,8 @@ class _PreviewScreenState extends State<PreviewScreen> {
       active: widget.active,
       seekSeconds: widget.seekSeconds,
       onExport: widget.onExport,
-      onBack: widget.onBack,
+      onBack: _back,
+      videoZoom: _videoZoom,
       onPrevious: widget.onPrevious,
       onNext: widget.onNext,
       busy: widget.busy,
@@ -361,7 +379,10 @@ class _PreviewScreenState extends State<PreviewScreen> {
           : readerSystemStyle,
       child: CallbackShortcuts(
         bindings: {
-          const SingleActivator(LogicalKeyboardKey.escape): widget.onBack,
+          const SingleActivator(
+            LogicalKeyboardKey.escape,
+            includeRepeats: false,
+          ): _back,
         },
         child: Focus(
           autofocus: true,

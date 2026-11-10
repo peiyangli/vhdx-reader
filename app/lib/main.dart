@@ -1805,7 +1805,7 @@ class _ReaderHomeState extends State<ReaderHome> {
     _syncThumbnails();
   });
 
-  final _previewKey = GlobalKey();
+  final _previewKey = GlobalKey<PreviewScreenState>();
   bool get _compact => ScreenLayout(context).compact;
 
   void _goBack() {
@@ -1814,6 +1814,7 @@ class _ReaderHomeState extends State<ReaderHome> {
       return;
     }
     if (_preview?.media != null) {
+      if (_previewKey.currentState?.exitVideoZoom() ?? false) return;
       if (_busy) _cancelOperation();
       _dismissPreview();
     } else if (_busy) {

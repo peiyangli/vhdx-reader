@@ -118,9 +118,13 @@ void main() {
       expect(find.byKey(const Key('media-volume')), findsNothing);
       final surface = find.byKey(const Key('media-surface'));
       await tester.tapAt(tester.getCenter(surface));
+      // A single tap waits for the double-tap zoom recognition window.
+      await tester.pump(const Duration(milliseconds: 350));
       await tester.pumpAndSettle();
       expect(find.byKey(const Key('media-play')).hitTestable(), findsNothing);
       await tester.tapAt(tester.getCenter(surface));
+      // A single tap waits for the double-tap zoom recognition window.
+      await tester.pump(const Duration(milliseconds: 350));
       await tester.pumpAndSettle();
       expect(find.byKey(const Key('media-play')).hitTestable(), findsOneWidget);
       await source.player.setRate(1.25);

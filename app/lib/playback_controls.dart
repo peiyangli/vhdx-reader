@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'window_chrome.dart';
+import 'video_zoom.dart';
 import 'package:flutter/services.dart';
 
 /// Independent from the decoder so gesture arbitration can be tested directly.
@@ -16,6 +17,8 @@ class PlaybackControls extends StatefulWidget {
     required this.onMute,
     required this.onSeek,
     required this.onExit,
+    this.playbackRate = 1,
+    this.onCycleRate,
     this.buffering = false,
     this.error,
     this.enabled = true,
@@ -28,7 +31,9 @@ class PlaybackControls extends StatefulWidget {
     this.onPullEnd,
     this.onPullCancel,
     this.pulling = false,
+    this.zoom,
   });
+  final VideoZoomController? zoom;
   final bool enabled;
   final int seekSeconds;
   final ValueChanged<double>? onPullUpdate;
@@ -43,6 +48,8 @@ class PlaybackControls extends StatefulWidget {
   final Duration duration;
   final bool playing;
   final bool muted;
+  final double playbackRate;
+  final VoidCallback? onCycleRate;
   final bool buffering;
   final String? error;
   final VoidCallback onPlay;
@@ -56,7 +63,8 @@ class PlaybackControls extends StatefulWidget {
 class _PlaybackControlsState extends State<PlaybackControls> {
   final _keyboardFocus = FocusNode();
   Map<ShortcutActivator, VoidCallback> get _bindings => {
-    const SingleActivator(LogicalKeyboardKey.escape): widget.onExit,
+    const SingleActivator(LogicalKeyboardKey.escape, includeRepeats: false):
+        _exit,
     const SingleActivator(LogicalKeyboardKey.arrowLeft): () => _skip(-1),
     const SingleActivator(LogicalKeyboardKey.arrowRight): () => _skip(1),
     const SingleActivator(
@@ -73,13 +81,13 @@ class _PlaybackControlsState extends State<PlaybackControls> {
       LogicalKeyboardKey.pageUp,
       includeRepeats: false,
     ): () {
-      if (widget.enabled && !widget.pulling) widget.onPrevious?.call();
+      if (widget.enabled && !widget.pulling) _switchVideo(widget.onPrevious);
     },
     const SingleActivator(
       LogicalKeyboardKey.pageDown,
       includeRepeats: false,
     ): () {
-      if (widget.enabled && !widget.pulling) widget.onNext?.call();
+      if (widget.enabled && !widget.pulling) _switchVideo(widget.onNext);
     },
     const SingleActivator(LogicalKeyboardKey.space, includeRepeats: false): () {
       if (widget.enabled && !widget.pulling) widget.onPlay();
@@ -115,6 +123,60 @@ class _PlaybackControlsState extends State<PlaybackControls> {
     return KeyEventResult.ignored;
   }
 
+  final Set<int> _pointers = {};
+  bool _zoomSession = false;
+  bool _blockedSequence = false;
+  Offset? _doubleTapPoint;
+  bool get _zoomSurface => (widget.zoom?.active ?? false) || _zoomSession;
+  bool get _canGesture =>
+      widget.enabled && !widget.pulling && !_blockedSequence;
+
+  void _exit() {
+    if (widget.zoom?.reset() ?? false) return;
+    widget.onExit();
+  }
+
+  void _switchVideo(VoidCallback? action) {
+    if (action == null) return;
+    widget.zoom?.reset();
+    action();
+  }
+
+  void _pointerDown(PointerEvent event) {
+    if (_pointers.isEmpty) {
+      _zoomSession = widget.zoom?.active ?? false;
+      _blockedSequence = false;
+    }
+    _pointers.add(event.pointer);
+    if (_pointers.length > 1 && !_zoomSession) {
+      // A second finger must never turn a pinch into a switch or dismissal.
+      _blockedSequence = true;
+      _across = _down = 0;
+      _endHold();
+      widget.onPullCancel?.call();
+    }
+  }
+
+  void _pointerEnd(PointerEvent event, {bool cancelled = false}) {
+    _pointers.remove(event.pointer);
+    _endHold();
+    if (cancelled) {
+      _blockedSequence = true;
+      widget.onPullCancel?.call();
+    }
+    // Pointer listeners run before recognizers finish this event. Keep the
+    // scale recognizer alive through its final up, even after zoom resets.
+    if (_pointers.isEmpty) {
+      scheduleMicrotask(() {
+        if (!mounted || _pointers.isNotEmpty) return;
+        setState(() {
+          _zoomSession = false;
+          _blockedSequence = false;
+        });
+      });
+    }
+  }
+
   bool _visible = true;
   double? _seek;
   double _down = 0;
@@ -141,7 +203,11 @@ class _PlaybackControlsState extends State<PlaybackControls> {
   @override
   void didUpdateWidget(covariant PlaybackControls oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (!widget.enabled) _endHold(rebuild: false);
+    if (!widget.enabled) {
+      _blockedSequence = _pointers.isNotEmpty;
+      _endHold(rebuild: false);
+    }
+    if (widget.zoom?.active ?? false) _endHold(rebuild: false);
     if (widget.enabled && !oldWidget.enabled) _focusWhenReady();
   }
 
@@ -168,6 +234,9 @@ class _PlaybackControlsState extends State<PlaybackControls> {
   void _toggleControls() => setState(() => _visible = !_visible);
   static const _shadow = [Shadow(color: Colors.black87, blurRadius: 4)];
 
+  String get _rateLabel =>
+      '${widget.playbackRate == widget.playbackRate.roundToDouble() ? widget.playbackRate.toInt() : widget.playbackRate}×';
+
   @override
   Widget build(BuildContext context) {
     final duration = widget.duration.inMilliseconds.toDouble();
@@ -186,37 +255,89 @@ class _PlaybackControlsState extends State<PlaybackControls> {
             Positioned.fill(
               child: Semantics(
                 label: _visible ? '隐藏播放控件' : '显示播放控件',
-                onDismiss: widget.onExit,
+                onDismiss: _exit,
                 child: Listener(
-                  onPointerUp: (_) => _endHold(),
-                  onPointerCancel: (_) {
-                    _endHold();
-                    widget.onPullCancel?.call();
-                  },
+                  onPointerDown: _pointerDown,
+                  onPointerPanZoomStart: _pointerDown,
+                  onPointerPanZoomEnd: _pointerEnd,
+                  onPointerUp: _pointerEnd,
+                  onPointerCancel: (event) =>
+                      _pointerEnd(event, cancelled: true),
                   child: GestureDetector(
                     key: const Key('media-surface'),
                     behavior: HitTestBehavior.opaque,
-                    onTap: widget.pulling ? null : _toggleControls,
+                    onTap: () {
+                      if (!widget.pulling && !_blockedSequence) {
+                        _toggleControls();
+                      }
+                    },
+                    onDoubleTapDown: widget.zoom == null
+                        ? null
+                        : (details) {
+                            _doubleTapPoint = details.localPosition;
+                          },
+                    onDoubleTapCancel: widget.zoom == null
+                        ? null
+                        : () => _doubleTapPoint = null,
+                    onDoubleTap: widget.zoom == null
+                        ? null
+                        : () {
+                            if (_canGesture && _doubleTapPoint != null) {
+                              _endHold();
+                              widget.zoom!.toggle(_doubleTapPoint!);
+                            }
+                            _doubleTapPoint = null;
+                          },
+                    onScaleStart: _zoomSurface
+                        ? (details) {
+                            if (_canGesture) {
+                              widget.zoom?.start(details.localFocalPoint);
+                            }
+                          }
+                        : null,
+                    onScaleUpdate: _zoomSurface
+                        ? (details) {
+                            if (_canGesture) {
+                              widget.zoom?.update(
+                                details.localFocalPoint,
+                                details.scale,
+                              );
+                            }
+                          }
+                        : null,
                     onLongPressStart:
                         widget.enabled &&
                             !widget.pulling &&
+                            !_zoomSurface &&
                             widget.onHoldStart != null
                         ? (_) {
+                            if (!_canGesture || _pointers.length > 1) return;
                             setState(() => _holding = true);
                             widget.onHoldStart!();
                           }
                         : null,
-                    onLongPressEnd: (_) => _endHold(),
-                    onLongPressCancel: _endHold,
-                    onHorizontalDragStart: widget.enabled && !widget.pulling
+                    onLongPressEnd: _zoomSurface ? null : (_) => _endHold(),
+                    onLongPressCancel: _zoomSurface ? null : _endHold,
+                    onHorizontalDragStart:
+                        widget.enabled && !widget.pulling && !_zoomSurface
                         ? (_) => _across = 0
                         : null,
-                    onHorizontalDragUpdate: widget.enabled && !widget.pulling
-                        ? (details) => _across += details.delta.dx
-                        : null,
-                    onHorizontalDragCancel: () => _across = 0,
-                    onHorizontalDragEnd: widget.enabled && !widget.pulling
+                    onHorizontalDragUpdate:
+                        widget.enabled && !widget.pulling && !_zoomSurface
                         ? (details) {
+                            if (_canGesture) _across += details.delta.dx;
+                          }
+                        : null,
+                    onHorizontalDragCancel: _zoomSurface
+                        ? null
+                        : () => _across = 0,
+                    onHorizontalDragEnd:
+                        widget.enabled && !widget.pulling && !_zoomSurface
+                        ? (details) {
+                            if (!_canGesture) {
+                              _across = 0;
+                              return;
+                            }
                             if (_across.abs() >= 80 ||
                                 (_across.abs() >= 24 &&
                                     (details.primaryVelocity ?? 0).abs() >
@@ -234,33 +355,68 @@ class _PlaybackControlsState extends State<PlaybackControls> {
                             _across = 0;
                           }
                         : null,
-                    onVerticalDragStart: (_) => _down = 0,
-                    onVerticalDragUpdate: (details) {
-                      _down += details.delta.dy;
-                      widget.onPullUpdate?.call(details.delta.dy);
-                    },
-                    onVerticalDragCancel: () {
-                      _down = 0;
-                      widget.onPullCancel?.call();
-                    },
-                    onVerticalDragEnd: (details) {
-                      if (widget.onPullEnd != null) {
-                        widget.onPullEnd!(details.primaryVelocity ?? 0);
-                        _down = 0;
-                        return;
-                      }
-                      if (_down >= 80 ||
-                          (_down >= 24 &&
-                              (details.primaryVelocity ?? 0) > 700)) {
-                        widget.onExit();
-                      }
-                      _down = 0;
-                    },
+                    onVerticalDragStart: _zoomSurface ? null : (_) => _down = 0,
+                    onVerticalDragUpdate: _zoomSurface
+                        ? null
+                        : (details) {
+                            if (!widget.enabled || _blockedSequence) return;
+                            _down += details.delta.dy;
+                            widget.onPullUpdate?.call(details.delta.dy);
+                          },
+                    onVerticalDragCancel: _zoomSurface
+                        ? null
+                        : () {
+                            _down = 0;
+                            widget.onPullCancel?.call();
+                          },
+                    onVerticalDragEnd: _zoomSurface
+                        ? null
+                        : (details) {
+                            if (!widget.enabled || _blockedSequence) {
+                              _down = 0;
+                              widget.onPullCancel?.call();
+                              return;
+                            }
+                            if (widget.onPullEnd != null) {
+                              widget.onPullEnd!(details.primaryVelocity ?? 0);
+                              _down = 0;
+                              return;
+                            }
+                            if (_down >= 80 ||
+                                (_down >= 24 &&
+                                    (details.primaryVelocity ?? 0) > 700)) {
+                              widget.onExit();
+                            }
+                            _down = 0;
+                          },
                   ),
                 ),
               ),
             ),
-            if (!widget.pulling && (_holding || _notice != null))
+            if (!widget.pulling && (widget.zoom?.active ?? false))
+              Positioned(
+                top: 0,
+                left: 0,
+                right: 0,
+                child: IgnorePointer(
+                  child: SafeArea(
+                    minimum: const EdgeInsets.all(16),
+                    child: Text(
+                      '画面放大 ${widget.zoom!.scale.toStringAsFixed(1)}× · 双击恢复',
+                      key: const Key('media-zoom-notice'),
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        shadows: _shadow,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            if (!widget.pulling &&
+                !(widget.zoom?.active ?? false) &&
+                (_holding || _notice != null))
               Positioned(
                 top: 0,
                 left: 0,
@@ -390,6 +546,27 @@ class _PlaybackControlsState extends State<PlaybackControls> {
                                       ? Icons.volume_off
                                       : Icons.volume_up,
                                   shadows: _shadow,
+                                ),
+                              ),
+                              Tooltip(
+                                message: '切换播放倍速（当前 $_rateLabel）',
+                                child: TextButton(
+                                  key: const Key('media-rate'),
+                                  onPressed: widget.enabled
+                                      ? widget.onCycleRate
+                                      : null,
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: Colors.white,
+                                    disabledForegroundColor: Colors.white38,
+                                    minimumSize: const Size(56, 48),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
+                                  ),
+                                  child: Text(
+                                    _rateLabel,
+                                    style: const TextStyle(shadows: _shadow),
+                                  ),
                                 ),
                               ),
                             ],

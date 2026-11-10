@@ -11,6 +11,8 @@ void main() {
     VoidCallback? exit,
     VoidCallback? play,
     VoidCallback? mute,
+    VoidCallback? cycleRate,
+    double playbackRate = 1,
     VoidCallback? next,
     VoidCallback? previous,
     VoidCallback? holdStart,
@@ -29,6 +31,8 @@ void main() {
             duration: duration,
             playing: true,
             muted: false,
+            playbackRate: playbackRate,
+            onCycleRate: cycleRate ?? () {},
             onPlay: play ?? () {},
             onMute: mute ?? () {},
             onSeek: seek ?? (_) {},
@@ -47,12 +51,13 @@ void main() {
   }
 
   testWidgets(
-    'only three controls, transparent panel and tap toggles without pausing',
+    'playback controls use transparent panel and tap toggles without pausing',
     (tester) async {
       var plays = 0;
       await show(tester, play: () => plays++);
       expect(find.byType(Slider), findsOneWidget);
       expect(find.byType(IconButton), findsNWidgets(2));
+      expect(find.byKey(const Key('media-rate')), findsOneWidget);
       final material = tester.widget<Material>(
         find
             .descendant(
@@ -74,6 +79,42 @@ void main() {
       await tester.pumpAndSettle();
       expect(plays, 1);
       expect(find.byKey(const Key('media-play')).hitTestable(), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'rate button switches on a single tap and respects disabled state',
+    (tester) async {
+      var switches = 0;
+      var plays = 0;
+      var holds = 0;
+      await show(
+        tester,
+        cycleRate: () => switches++,
+        play: () => plays++,
+        holdStart: () => holds++,
+      );
+      final button = find.byKey(const Key('media-rate'));
+      expect(find.text('1×'), findsOneWidget);
+      await tester.tap(button);
+      await tester.pumpAndSettle();
+      expect(switches, 1);
+      expect(plays, 0);
+      expect(holds, 0);
+      expect(button.hitTestable(), findsOneWidget);
+      for (final rate in [1.5, 2.0, 0.25, 0.5, 1.0]) {
+        await show(tester, playbackRate: rate, cycleRate: () => switches++);
+        final label = rate == rate.roundToDouble()
+            ? '${rate.toInt()}'
+            : '$rate';
+        expect(find.text('$label×'), findsOneWidget);
+        await tester.tap(button);
+        await tester.pumpAndSettle();
+      }
+      expect(switches, 6);
+      await show(tester, enabled: false, cycleRate: () => switches++);
+      await tester.tap(button);
+      expect(switches, 6);
     },
   );
 

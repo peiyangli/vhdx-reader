@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'playback_controls.dart';
 import 'media_playback_events.dart';
 import 'video_dismiss_view.dart';
+import 'video_zoom.dart';
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
@@ -71,6 +72,8 @@ class MediaPreviewSource extends ChangeNotifier {
   bool playing = false;
   bool buffering = true;
   double volume = 100;
+  double playbackRate = 1;
+  static const _playbackRates = [0.25, 0.5, 1.0, 1.5, 2.0];
   String? error;
   Future<void> _commands = Future.value();
 
@@ -311,6 +314,18 @@ class MediaPreviewSource extends ChangeNotifier {
   Future<void> seek(Duration value) => _command(() => player.seek(value));
   Future<void> setVolume(double value) =>
       _command(() => player.setVolume(value.clamp(0, 100)));
+  Future<void> cycleRate() => _command(() async {
+    final next =
+        _playbackRates[(_playbackRates.indexOf(playbackRate) + 1) %
+            _playbackRates.length];
+    if (_restoreRate != null) {
+      _restoreRate = next;
+    } else {
+      await player.setRate(next);
+    }
+    playbackRate = next;
+    _changed();
+  });
   Future<Map<String, dynamic>> statistics() =>
       backend.request({'op': 'media_status', 'file': file});
 
@@ -417,7 +432,9 @@ class MediaPreview extends StatefulWidget {
     this.switching = false,
     this.seekSeconds = 5,
     this.message,
+    this.zoom,
   });
+  final VideoZoomController? zoom;
   final VoidCallback? onPrevious;
   final VoidCallback? onNext;
   final bool switching;
@@ -432,11 +449,16 @@ class MediaPreview extends StatefulWidget {
 
 class _MediaPreviewState extends State<MediaPreview>
     with WidgetsBindingObserver {
+  final _localZoom = VideoZoomController();
+  VideoZoomController get _zoom => widget.zoom ?? _localZoom;
   bool _foreground = true;
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final active = readerIsForeground(defaultTargetPlatform, state);
-    if (!active) unawaited(widget.source.suspend());
+    if (!active) {
+      _zoom.reset();
+      unawaited(widget.source.suspend());
+    }
     if (active) widget.source.setVisible(widget.active);
     if (mounted) setState(() => _foreground = active);
   }
@@ -444,6 +466,7 @@ class _MediaPreviewState extends State<MediaPreview>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _localZoom.dispose();
     unawaited(widget.source.endBoost(pause: true));
     super.dispose();
   }
@@ -460,56 +483,77 @@ class _MediaPreviewState extends State<MediaPreview>
   @override
   void didUpdateWidget(covariant MediaPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (widget.source != oldWidget.source) _zoom.reset(notify: false);
     if (widget.active != oldWidget.active) {
       widget.source.setVisible(widget.active && _foreground);
     }
   }
 
   @override
-  Widget build(BuildContext context) => VideoDismissView(
-    enabled: widget.active && _foreground && !widget.switching,
-    onStart: () => unawaited(widget.source.beginPull()),
-    onCancel: () => unawaited(widget.source.cancelPull()),
-    onDismiss: widget.onExit,
-    child: Video(
-      controller: widget.source.controller,
-      controls: NoVideoControls,
-      fill: Colors.transparent,
-      pauseUponEnteringBackgroundMode: !isDesktopPlatform(
-        defaultTargetPlatform,
-      ),
-      resumeUponEnteringForegroundMode: false,
-    ),
-    controls: (update, end, cancel, pulling) => AnimatedBuilder(
-      animation: widget.source,
-      builder: (context, child) => PlaybackControls(
-        seekSeconds: widget.seekSeconds,
-        position: widget.source.position,
-        duration: widget.source.duration,
-        playing: widget.source.playing,
-        muted: widget.source.volume == 0,
-        buffering: widget.source.buffering || widget.switching,
-        error: widget.message ?? widget.source.error,
-        enabled: widget.active && _foreground && !widget.switching,
-        onPullUpdate: update,
-        onPullEnd: end,
-        onPullCancel: cancel,
-        pulling: pulling,
-        onPrevious: widget.onPrevious,
-        onNext: widget.onNext,
-        onHoldStart: widget.source.error == null
-            ? () => unawaited(widget.source.beginBoost())
+  Widget build(BuildContext context) {
+    final enabled = widget.active && _foreground && !widget.switching;
+    if (!enabled) _zoom.reset(notify: false);
+    return ValueListenableBuilder<Rect?>(
+      valueListenable: widget.source.controller.rect,
+      builder: (context, rect, child) => VideoZoomView(
+        controller: _zoom,
+        aspectRatio: rect != null && rect.width > 1 && rect.height > 1
+            ? rect.width / rect.height
             : null,
-        onHoldEnd: () => unawaited(widget.source.endBoost()),
-        onPlay: () => unawaited(widget.source.toggle()),
-        onMute: widget.source.audioOutputAvailable
-            ? () => unawaited(
-                widget.source.setVolume(widget.source.volume == 0 ? 100 : 0),
-              )
-            : null,
-        onSeek: (value) => unawaited(widget.source.seek(value)),
-        onExit: widget.onExit,
+        child: child!,
+        builder: (context, frame) => VideoDismissView(
+          enabled: enabled && !_zoom.active,
+          onStart: () => unawaited(widget.source.beginPull()),
+          onCancel: () => unawaited(widget.source.cancelPull()),
+          onDismiss: widget.onExit,
+          child: frame,
+          controls: (update, end, cancel, pulling) => AnimatedBuilder(
+            animation: widget.source,
+            builder: (context, child) => PlaybackControls(
+              zoom: _zoom,
+              seekSeconds: widget.seekSeconds,
+              position: widget.source.position,
+              duration: widget.source.duration,
+              playing: widget.source.playing,
+              muted: widget.source.volume == 0,
+              playbackRate: widget.source.playbackRate,
+              onCycleRate: () => unawaited(widget.source.cycleRate()),
+              buffering: widget.source.buffering || widget.switching,
+              error: widget.message ?? widget.source.error,
+              enabled: enabled,
+              onPullUpdate: update,
+              onPullEnd: end,
+              onPullCancel: cancel,
+              pulling: pulling,
+              onPrevious: widget.onPrevious,
+              onNext: widget.onNext,
+              onHoldStart: widget.source.error == null
+                  ? () => unawaited(widget.source.beginBoost())
+                  : null,
+              onHoldEnd: () => unawaited(widget.source.endBoost()),
+              onPlay: () => unawaited(widget.source.toggle()),
+              onMute: widget.source.audioOutputAvailable
+                  ? () => unawaited(
+                      widget.source.setVolume(
+                        widget.source.volume == 0 ? 100 : 0,
+                      ),
+                    )
+                  : null,
+              onSeek: (value) => unawaited(widget.source.seek(value)),
+              onExit: widget.onExit,
+            ),
+          ),
+        ),
       ),
-    ),
-  );
+      child: Video(
+        controller: widget.source.controller,
+        controls: NoVideoControls,
+        fill: Colors.transparent,
+        pauseUponEnteringBackgroundMode: !isDesktopPlatform(
+          defaultTargetPlatform,
+        ),
+        resumeUponEnteringForegroundMode: false,
+      ),
+    );
+  }
 }
